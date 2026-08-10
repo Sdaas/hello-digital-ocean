@@ -7,3 +7,11 @@ SESSION_STATE.md
 
 # local env
 .env
+
+# demo app (Python) — local runtime data + tool caches
+demo/.localdata/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+demo/.venv/

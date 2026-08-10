@@ -14,5 +14,13 @@ jobs:
       - name: Install dev dependencies
         run: sudo apt-get update && sudo apt-get install -y shellcheck bats zsh
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install demo app deps
+        run: pip install -r demo/requirements.txt -r demo/requirements-dev.txt
+
       - name: Run test suite
         run: ./test.sh

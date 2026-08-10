@@ -71,6 +71,36 @@ else
 	FAILED=1
 fi
 
+# --- python lane (demo app) -------------------------------------------------
+# The demo app (demo/, COMP-3) is Python/Flask. Its pytest suite runs here,
+# mirroring how bats is treated: pytest is a dev dependency. The fast lane
+# excludes the `integration` marker (the real-Ollama test); --integration adds
+# it back, and those tests self-skip when Ollama is absent.
+echo "==> pytest (demo app)"
+if [[ -d demo/tests ]]; then
+	if ! command -v pytest >/dev/null 2>&1; then
+		echo "    ERROR: pytest not found (dev dependency). Install it:" >&2
+		echo "      pip install -r demo/requirements.txt -r demo/requirements-dev.txt" >&2
+		exit 1
+	fi
+	if [[ "$INTEGRATION" -eq 1 ]]; then
+		echo "    (integration lane enabled — includes real-Ollama tests, self-skipping)"
+		PYTEST_OK=0
+		pytest demo/tests -q || PYTEST_OK=$?
+	else
+		PYTEST_OK=0
+		pytest demo/tests -q -m "not integration" || PYTEST_OK=$?
+	fi
+	if [[ "$PYTEST_OK" -eq 0 ]]; then
+		echo "    tests passed"
+	else
+		echo "    tests FAILED"
+		FAILED=1
+	fi
+else
+	echo "    no demo/tests — skipped"
+fi
+
 echo
 if [[ "$FAILED" -eq 0 ]]; then
 	echo "ALL TESTS PASSED"
