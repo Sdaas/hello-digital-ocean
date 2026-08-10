@@ -82,6 +82,33 @@ This file remains the home for design notes that emerge during per-feature
   runs both scripts in a real `ubuntu:22.04` Docker container (self-skips without
   `docker`); the volume-mount **positive path** and GPU-**present** path can only
   be exercised on a real droplet, so their un-mocked VERIFY is **deferred to F7**.
+- **DO resource provisioning (F6):** two **hidden** CLI subcommands —
+  `digital-ocean provision` and `deprovision` (not in `usage`; F7 `start` and F8
+  `stop`/`destroy` call the same helper functions later). `provision` **ensures**
+  (find-by-name → adopt, else create) a private VPC, the two volumes (data 10 GB
+  → CPU, models 50 GB → GPU; ADR-0003), and the CPU + GPU droplets (SSH key by
+  name, on the VPC; ADR-0007), **attaches** data→CPU / models→GPU, and records
+  everything to **`.do/state`** (env-style `KEY=value`, `0600`, gitignored under
+  `.do/`, sourceable — same discipline as F4's `.do/config`; IDs + names + IPs
+  that F7/F8/F9 consume). It **reads `.do/config`** and hard-fails with "run
+  setup first" if absent. **Idempotent, no double-spend**: adopt-by-name is the
+  source of truth; state is rebuilt after each ensure step. Fixed **`hello-do-`**
+  resource names (overridable via env/config). Volumes are created **`--fs-type
+  ext4`** so a filesystem always exists and the F5 provision scripts' format-if-
+  empty is a guaranteed no-op (never reformats — persistence, ADR-0001/0003).
+  Attach **skips** when already on the target droplet, **errors** when attached
+  elsewhere. **No auto-rollback** on partial failure (re-run adopts, or
+  `deprovision` cleans up). Droplet images are **config-driven** (`DO_CPU_IMAGE`
+  default `ubuntu-22-04-x64`; `DO_GPU_IMAGE` = DO's AI/ML-ready image, resolved
+  at VERIFY). A **source-guard** (`DO_SOURCE_ONLY=1`) lets the helper functions
+  be loaded without running `main`, so the real-boundary test can drive them and
+  F7 can reuse them. The doctl-**create** boundary is stubbed in the fast lane
+  (`tests/do-provision.bats`), which obligates the opt-in, self-skipping
+  cheap-real `tests/integration/do-provision.bats` (`DO_REAL_PROVISION=1`; real
+  VPC + one small volume: create→adopt→destroy against live DO — **passed**
+  2026-08-10); the **attach positive path and real
+  droplet create are deferred to F7** (billable/GPU), mirroring F5's deferred
+  volume-mount VERIFY.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,

@@ -39,6 +39,10 @@ OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 # read this file. Env-style KEY=value (sourceable — no jq dependency).
 CONFIG_DIR="${DO_CONFIG_DIR:-$REPO_ROOT/.do}"
 CONFIG_FILE="$CONFIG_DIR/config"
+# Where `provision`/`deprovision` (F6) record the DO resource state (VPC, volume,
+# droplet IDs + IPs). Same dir/discipline as the config: repo-local, gitignored,
+# written 0600, sourceable env-style KEY=value. F7/F8/F9 read this file.
+DO_STATE_FILE="$CONFIG_DIR/state"
 
 # --- Logging (see design/overview.md) ---------------------------------------
 # Leveled logging to STDERR so stdout carries only real output/data. Two levels
@@ -383,6 +387,249 @@ cmd_setup() {
 	echo "$CONFIG_FILE"
 }
 
+# --- `digital-ocean provision` / `deprovision` (F6) -------------------------
+# HIDDEN low-level commands (not in usage): F7 `start` and F8 `stop`/`destroy`
+# are the public surface and call these same helpers. `provision` ensures (find-
+# by-name → adopt, else create) a private VPC, the two volumes and the CPU + GPU
+# droplets, attaches the volumes, and records `.do/state`. Idempotent — a re-run
+# adopts everything and creates nothing (no double-spend). Reads `.do/config`.
+
+# Resolve a DO SSH key NAME to its ID (last field of the matching list row).
+# Echoes the ID, or nothing when the name is not registered on the account.
+_resolve_ssh_key() { # name
+	doctl compute ssh-key list --format Name,ID --no-header 2>/dev/null |
+		while IFS= read -r line; do
+			id="${line##* }"  # last whitespace-delimited field
+			kn="${line% *}"   # everything before it (name may contain spaces)
+			if [ "$kn" = "$1" ]; then
+				printf '%s' "$id"
+				break
+			fi
+		done
+}
+
+# Ensure a VPC named $1 in $DO_REGION exists. Echoes its ID (adopt or create).
+ensure_vpc() { # name
+	id="$(doctl vpcs list --format Name,ID --no-header 2>/dev/null | awk -v n="$1" '$1==n{print $2; exit}')"
+	if [ -n "$id" ]; then
+		log_info "vpc $1: adopting existing ($id)"
+	else
+		log_info "vpc $1: creating in $DO_REGION"
+		id="$(doctl vpcs create --name "$1" --region "$DO_REGION" --format ID --no-header)"
+	fi
+	printf '%s' "$id"
+}
+
+# Ensure a ${2}GiB volume named $1 in $DO_REGION exists. Echoes its ID. Created
+# with an ext4 filesystem so the F5 provision scripts' format-if-empty is a
+# guaranteed no-op — they never reformat, so data persists across stop (ADR-0003).
+ensure_volume() { # name size-gib
+	id="$(doctl compute volume list --format Name,ID --no-header 2>/dev/null | awk -v n="$1" '$1==n{print $2; exit}')"
+	if [ -n "$id" ]; then
+		log_info "volume $1: adopting existing ($id)"
+	else
+		log_info "volume $1: creating (${2}GiB, ext4)"
+		id="$(doctl compute volume create "$1" --region "$DO_REGION" --size "${2}GiB" --fs-type ext4 --format ID --no-header)"
+	fi
+	printf '%s' "$id"
+}
+
+# Ensure droplet $1 (size $2, image $3) on $DO_VPC_ID with $SSH_KEY_ID exists.
+# Echoes "ID PUBLIC_IP PRIVATE_IP" (adopt or create; create --wait for the IPs).
+ensure_droplet() { # name size image
+	line="$(doctl compute droplet list --format Name,ID,PublicIPv4,PrivateIPv4 --no-header 2>/dev/null |
+		awk -v n="$1" '$1==n{print $2, $3, $4; exit}')"
+	if [ -n "$line" ]; then
+		log_info "droplet $1: adopting existing"
+	else
+		log_info "droplet $1: creating ($2, image $3)"
+		line="$(doctl compute droplet create "$1" --region "$DO_REGION" --size "$2" --image "$3" \
+			--ssh-keys "$SSH_KEY_ID" --vpc-uuid "$DO_VPC_ID" --wait \
+			--format ID,PublicIPv4,PrivateIPv4 --no-header)"
+	fi
+	printf '%s' "$line"
+}
+
+# Attach volume $1 to droplet $2. Skips if already on the target; hard-errors if
+# attached to a DIFFERENT droplet (shouldn't happen — stop destroys droplets, so
+# volumes come back detached; a mismatch means something is off, so fail loudly).
+attach_volume() { # vol-id droplet-id
+	attached="$(doctl compute volume get "$1" --format DropletIDs --no-header 2>/dev/null | tr -d '[]", ')"
+	if [ -z "$attached" ]; then
+		log_info "attaching volume $1 → droplet $2"
+		doctl compute volume-action attach "$1" "$2" --wait >/dev/null
+	elif [ "$attached" = "$2" ]; then
+		log_info "volume $1 already attached to $2"
+	else
+		log_error "volume $1 is attached to a different droplet ($attached) — refusing to reattach."
+		return 1
+	fi
+}
+
+# Rewrite .do/state from the current DO_* vars (atomic, private perms). Called
+# after each ensure step so state never claims a resource that wasn't made.
+write_state() {
+	mkdir -p "$CONFIG_DIR"
+	old_umask="$(umask)"
+	umask 077
+	tmp="$DO_STATE_FILE.tmp.$$"
+	{
+		printf '# digital-ocean state — written by "digital-ocean provision" (F6). Gitignored; do not commit.\n'
+		_kv DO_VPC_ID "${DO_VPC_ID:-}"
+		_kv DO_VPC_NAME "${DO_VPC_NAME:-}"
+		_kv DO_DATA_VOLUME_ID "${DO_DATA_VOLUME_ID:-}"
+		_kv DO_DATA_VOLUME_NAME "${DO_DATA_VOLUME_NAME:-}"
+		_kv DO_MODELS_VOLUME_ID "${DO_MODELS_VOLUME_ID:-}"
+		_kv DO_MODELS_VOLUME_NAME "${DO_MODELS_VOLUME_NAME:-}"
+		_kv DO_CPU_DROPLET_ID "${DO_CPU_DROPLET_ID:-}"
+		_kv DO_CPU_PUBLIC_IP "${DO_CPU_PUBLIC_IP:-}"
+		_kv DO_CPU_PRIVATE_IP "${DO_CPU_PRIVATE_IP:-}"
+		_kv DO_GPU_DROPLET_ID "${DO_GPU_DROPLET_ID:-}"
+		_kv DO_GPU_PUBLIC_IP "${DO_GPU_PUBLIC_IP:-}"
+		_kv DO_GPU_PRIVATE_IP "${DO_GPU_PRIVATE_IP:-}"
+	} >"$tmp"
+	mv "$tmp" "$DO_STATE_FILE"
+	umask "$old_umask"
+}
+
+# Load .do/config and apply F6 defaults (env override > config > default). Fails
+# if no config exists. Sets DO_REGION, sizes, resource names, and image slugs.
+_provision_load_config() {
+	if [ ! -f "$CONFIG_FILE" ]; then
+		log_error "no config at $CONFIG_FILE — run 'digital-ocean setup' first."
+		return 1
+	fi
+	log_debug "loading config $CONFIG_FILE"
+	# shellcheck disable=SC1090
+	. "$CONFIG_FILE"
+
+	DO_REGION="${DO_REGION:-ams3}"
+	DO_CPU_SIZE="${DO_CPU_SIZE:-s-2vcpu-4gb}"
+	DO_GPU_SIZE="${DO_GPU_SIZE:-gpu-4000adax1-20gb}"
+	# Default so a config missing this key gives the clean "key not found" error
+	# below rather than a set -u "unbound variable" crash.
+	DO_SSH_KEY_NAME="${DO_SSH_KEY_NAME:-}"
+	# Resource names — fixed hello-do- prefix, overridable via env/config.
+	DO_VPC_NAME="${DO_VPC_NAME:-hello-do-vpc}"
+	DO_DATA_VOLUME_NAME="${DO_DATA_VOLUME_NAME:-hello-do-data}"
+	DO_MODELS_VOLUME_NAME="${DO_MODELS_VOLUME_NAME:-hello-do-models}"
+	DO_CPU_NAME="${DO_CPU_NAME:-hello-do-cpu}"
+	DO_GPU_NAME="${DO_GPU_NAME:-hello-do-gpu}"
+	# Volume sizes in GiB (ADR-0003 defaults).
+	DO_DATA_SIZE="${DO_DATA_SIZE:-10}"
+	DO_MODELS_SIZE="${DO_MODELS_SIZE:-50}"
+	# Droplet images. CPU: stock Ubuntu (matches provision-cpu.sh). GPU: DO's
+	# AI/ML-ready image that ships the NVIDIA driver provision-gpu.sh asserts —
+	# the default here is a PLACEHOLDER to be confirmed at VERIFY via
+	# `doctl compute image list --public`; override with DO_GPU_IMAGE.
+	DO_CPU_IMAGE="${DO_CPU_IMAGE:-ubuntu-22-04-x64}"
+	DO_GPU_IMAGE="${DO_GPU_IMAGE:-gpu-ubuntu-22-04}"
+}
+
+cmd_provision() {
+	if [ $# -gt 0 ]; then
+		log_error "unknown argument to 'provision': $1"
+		usage >&2
+		return 2
+	fi
+
+	_provision_load_config || return 1
+
+	log_info "Provisioning DO resources in $DO_REGION — this CREATES BILLABLE resources."
+
+	# Resolve the SSH key up front so a bad key name fails BEFORE anything bills.
+	SSH_KEY_ID="$(_resolve_ssh_key "$DO_SSH_KEY_NAME")"
+	if [ -z "$SSH_KEY_ID" ]; then
+		log_error "DO SSH key '$DO_SSH_KEY_NAME' not found (doctl compute ssh-key list)."
+		log_error "Fix DO_SSH_KEY_NAME in $CONFIG_FILE, or import it: doctl compute ssh-key import <name> --public-key-file ~/.ssh/id_ed25519.pub"
+		return 1
+	fi
+
+	DO_VPC_ID="$(ensure_vpc "$DO_VPC_NAME")"
+	write_state
+
+	DO_DATA_VOLUME_ID="$(ensure_volume "$DO_DATA_VOLUME_NAME" "$DO_DATA_SIZE")"
+	DO_MODELS_VOLUME_ID="$(ensure_volume "$DO_MODELS_VOLUME_NAME" "$DO_MODELS_SIZE")"
+	write_state
+
+	cpu_line="$(ensure_droplet "$DO_CPU_NAME" "$DO_CPU_SIZE" "$DO_CPU_IMAGE")"
+	DO_CPU_DROPLET_ID="$(printf '%s' "$cpu_line" | awk '{print $1}')"
+	DO_CPU_PUBLIC_IP="$(printf '%s' "$cpu_line" | awk '{print $2}')"
+	DO_CPU_PRIVATE_IP="$(printf '%s' "$cpu_line" | awk '{print $3}')"
+	gpu_line="$(ensure_droplet "$DO_GPU_NAME" "$DO_GPU_SIZE" "$DO_GPU_IMAGE")"
+	DO_GPU_DROPLET_ID="$(printf '%s' "$gpu_line" | awk '{print $1}')"
+	DO_GPU_PUBLIC_IP="$(printf '%s' "$gpu_line" | awk '{print $2}')"
+	DO_GPU_PRIVATE_IP="$(printf '%s' "$gpu_line" | awk '{print $3}')"
+	write_state
+
+	# data → CPU, models → GPU (ADR-0003).
+	attach_volume "$DO_DATA_VOLUME_ID" "$DO_CPU_DROPLET_ID"
+	attach_volume "$DO_MODELS_VOLUME_ID" "$DO_GPU_DROPLET_ID"
+	write_state
+
+	log_info "Provisioned. CPU $DO_CPU_PUBLIC_IP (private $DO_CPU_PRIVATE_IP), GPU $DO_GPU_PUBLIC_IP (private $DO_GPU_PRIVATE_IP)."
+	log_info "State recorded at $DO_STATE_FILE"
+	# stdout carries the state path only (data), per the logging convention.
+	echo "$DO_STATE_FILE"
+}
+
+cmd_deprovision() {
+	WITH_VOLUMES=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--volumes)
+			WITH_VOLUMES=1
+			shift
+			;;
+		*)
+			log_error "unknown argument to 'deprovision': $1"
+			usage >&2
+			return 2
+			;;
+		esac
+	done
+
+	if [ ! -f "$DO_STATE_FILE" ]; then
+		log_info "no state at $DO_STATE_FILE — nothing to deprovision."
+		return 0
+	fi
+	# shellcheck disable=SC1090
+	. "$DO_STATE_FILE"
+
+	# Destroy both droplets (stop semantics — ADR-0001). Best-effort per resource.
+	for d in "${DO_CPU_DROPLET_ID:-}" "${DO_GPU_DROPLET_ID:-}"; do
+		if [ -n "$d" ]; then
+			log_info "destroying droplet $d"
+			doctl compute droplet delete "$d" --force >/dev/null 2>&1 || log_error "failed to delete droplet $d"
+		fi
+	done
+	DO_CPU_DROPLET_ID=""
+	DO_CPU_PUBLIC_IP=""
+	DO_CPU_PRIVATE_IP=""
+	DO_GPU_DROPLET_ID=""
+	DO_GPU_PUBLIC_IP=""
+	DO_GPU_PRIVATE_IP=""
+
+	if [ "$WITH_VOLUMES" -eq 1 ]; then
+		for v in "${DO_DATA_VOLUME_ID:-}" "${DO_MODELS_VOLUME_ID:-}"; do
+			if [ -n "$v" ]; then
+				log_info "destroying volume $v"
+				doctl compute volume delete "$v" --force >/dev/null 2>&1 || log_error "failed to delete volume $v"
+			fi
+		done
+		if [ -n "${DO_VPC_ID:-}" ]; then
+			log_info "destroying vpc $DO_VPC_ID"
+			doctl vpcs delete "$DO_VPC_ID" >/dev/null 2>&1 || log_error "failed to delete vpc $DO_VPC_ID"
+		fi
+		rm -f "$DO_STATE_FILE"
+		log_info "deprovisioned droplets + volumes + VPC. Removed $DO_STATE_FILE"
+		return 0
+	fi
+
+	write_state
+	log_info "deprovisioned droplets (volumes + VPC kept). State at $DO_STATE_FILE"
+}
+
 # --- Dispatch ----------------------------------------------------------------
 
 main() {
@@ -430,6 +677,12 @@ main() {
 	local)
 		cmd_local "$@"
 		;;
+	provision)
+		cmd_provision "$@"
+		;;
+	deprovision)
+		cmd_deprovision "$@"
+		;;
 	*)
 		log_error "unknown command: $subcommand"
 		usage >&2
@@ -438,4 +691,9 @@ main() {
 	esac
 }
 
-main "$@"
+# Allow sourcing the helper functions WITHOUT executing (DO_SOURCE_ONLY=1) — used
+# by the real-boundary test (tests/integration/do-provision.bats) to drive the
+# ensure_* functions against live DO, and available for F7's start to reuse.
+if [ -z "${DO_SOURCE_ONLY:-}" ]; then
+	main "$@"
+fi

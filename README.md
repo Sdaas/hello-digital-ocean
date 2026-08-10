@@ -94,6 +94,34 @@ non-zero. Declare checks in the `CHECKS` table near the top of `setup.sh`
 
 On other platforms `setup.sh` reports what to install by hand.
 
+### DigitalOcean access (`doctl`)
+
+The cloud commands drive DigitalOcean through **`doctl`**. Install it
+(`brew install doctl`), then authenticate with a personal access token created at
+<https://cloud.digitalocean.com/account/api/tokens/new>:
+
+```bash
+doctl auth init      # paste the token when prompted (stored in ~/.config/doctl)
+doctl account get    # sanity check — prints your account, no error
+```
+
+**Token scopes.** *Full Access* works and is simplest for a throwaway demo. For a
+least-privilege **custom-scoped** token, grant:
+
+| Resource | Scopes | Why |
+|---|---|---|
+| `account` | read | doctl's auth check (`account get`) |
+| `droplet` | create, read, update, delete | CPU + GPU droplets (F6/F7/F8) |
+| `block_storage` | create, read, update, delete | the two volumes (F6) |
+| `block_storage_action` | create, read | attach/detach + check attachment (F6) |
+| `vpc` | create, read, update, delete | the private VPC (F6, ADR-0007) |
+| `snapshot` | read, delete | `destroy` teardown (F8) |
+| `ssh_key` | read | resolve `DO_SSH_KEY_NAME` → key ID (F6/F7) |
+| `image`, `regions`, `sizes` | read | image/region/size validation (F7) |
+
+The token is a secret — it lives in `~/.config/doctl`, **never** in the repo or
+`.do/`.
+
 ## User Guide
 
 <!-- How an end user runs and uses digital-ocean. Filled in as features land. -->
@@ -131,6 +159,19 @@ automatically before every push. Write integration tests to **self-skip when
 their boundary is absent** (e.g. the service isn't running) so the hook stays
 non-blocking — a skipped test is a visible nudge, not a wall. `git push
 --no-verify` bypasses the hook if you must.
+
+**Billable real-boundary tests are double-gated.** A test that creates *real*
+(billable) DigitalOcean resources also requires an explicit opt-in env var, so
+`./test.sh --integration` never spends money by accident. The F6 resource-
+provisioning check is one:
+
+```bash
+# creates a throwaway VPC + 1 GiB volume, proves adopt-by-name, destroys both
+DO_REAL_PROVISION=1 bats tests/integration/do-provision.bats
+```
+
+It self-skips unless `doctl` is authenticated **and** `DO_REAL_PROVISION=1` is
+set. Cost is about a cent (resources live for seconds and self-clean).
 
 ## Release Process
 
