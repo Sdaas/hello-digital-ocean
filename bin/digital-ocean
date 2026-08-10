@@ -6,14 +6,33 @@
 # CLI that provisions and tears down the DigitalOcean infrastructure (droplets +
 # volumes) and runs the reference "demo" app on it — e.g. `digital-ocean start`,
 # `digital-ocean stop`, `digital-ocean setup`, `digital-ocean destroy`,
-# `digital-ocean local`. Those subcommands are added by later features (F3–F9);
-# this skeleton ships the CLI framework (--help/--verbose, strict mode, leveled
-# logging) that they build on.
+# `digital-ocean local`. The cloud subcommands are added by later features
+# (F4–F9); F3 ships the first real subcommand, `local`, plus the subcommand
+# dispatcher those siblings build on.
 #
 # Written to run under both bash and zsh: avoids bash-only features
 # (no arrays, no ${BASH_SOURCE}). Keep it that way.
 
 set -eu
+
+# --- Paths (portable: derive from $0, no ${BASH_SOURCE}) --------------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Where `local` keeps its runtime state (pid + captured app log). Overridable so
+# tests can point it at a throwaway dir. Defaults to the LOCAL data dir.
+STATE_DIR="${DO_LOCAL_STATE_DIR:-$REPO_ROOT/demo/.localdata}"
+PID_FILE="$STATE_DIR/local.pid"
+LOG_FILE="$STATE_DIR/local.log"
+
+# The venv `local` builds from demo/requirements.txt (the SAME manifest that
+# ships to DO — proving one dependency set runs in both places, UC7).
+VENV="$REPO_ROOT/.venv"
+
+# The demo app binds here under APP_ENV=LOCAL (config.py: 127.0.0.1:5000).
+LOCAL_URL="http://127.0.0.1:5000"
+# Local Ollama endpoint (matches the demo app's OLLAMA_URL default).
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 
 # --- Logging (see design/overview.md) ---------------------------------------
 # Leveled logging to STDERR so stdout carries only real output/data. Two levels
@@ -36,15 +55,162 @@ log_error() { log ERROR "$@"; }
 
 usage() {
 	cat <<EOF
-Usage: digital-ocean [--help] [--verbose]
+Usage: digital-ocean [--help] [--verbose] [<command>]
 
 Control CLI for the DigitalOcean demo host — provisions/tears down the DO
-infrastructure and runs the reference "demo" app on it. Subcommands
-(setup/start/stop/destroy/local/ssh/logs/status) are added in later features.
+infrastructure and runs the reference "demo" app on it.
+
+Commands:
+  local            Run the demo app on this Mac (venv + Flask + browser).
+  local down       Stop the locally running demo app.
+
+Cloud commands (setup/start/stop/destroy/ssh/logs/status) are added in later
+features. With no command, prints a short banner.
 EOF
 }
 
+# --- `digital-ocean local` (F3) ---------------------------------------------
+
+# Reachable if the local Ollama server answers /api/tags. Used as an `if`
+# condition, so a non-zero curl doesn't trip `set -e`.
+_ollama_reachable() {
+	curl -fsS --max-time 2 "$OLLAMA_URL/api/tags" >/dev/null 2>&1
+}
+
+# True while pid $1 exists.
+_alive() {
+	[ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null
+}
+
+# Poll the app's /health until it answers 200, up to ~15s.
+_wait_health() {
+	tries=0
+	while [ "$tries" -lt 30 ]; do
+		if curl -fsS --max-time 1 "$LOCAL_URL/health" >/dev/null 2>&1; then
+			return 0
+		fi
+		sleep 0.5
+		tries=$((tries + 1))
+	done
+	return 1
+}
+
+# Open the app in a browser, unless suppressed or unavailable.
+_open_browser() {
+	if [ "${DO_LOCAL_NO_BROWSER:-}" = "1" ]; then
+		log_info "browser open skipped (DO_LOCAL_NO_BROWSER=1)"
+	elif command -v open >/dev/null 2>&1; then
+		open "$LOCAL_URL" || log_error "could not open a browser at $LOCAL_URL"
+	else
+		log_info "open $LOCAL_URL in your browser"
+	fi
+}
+
+cmd_local() {
+	# `local down` is the teardown; everything else must be empty.
+	if [ "${1:-}" = "down" ]; then
+		cmd_local_down
+		return $?
+	fi
+	if [ $# -gt 0 ]; then
+		log_error "unknown argument to 'local': $1"
+		usage >&2
+		return 2
+	fi
+
+	# Already running? Re-open the browser rather than starting a second copy.
+	if [ -f "$PID_FILE" ]; then
+		running="$(cat "$PID_FILE" 2>/dev/null || true)"
+		if _alive "$running"; then
+			log_info "digital-ocean local already running (pid $running)."
+			_open_browser
+			echo "$LOCAL_URL"
+			return 0
+		fi
+		log_debug "removing stale pid file (pid $running no longer alive)"
+		rm -f "$PID_FILE"
+	fi
+
+	# Fail fast if Ollama is down — before building a venv, so we don't do a
+	# pointless pip install when the model backend isn't even up.
+	if ! _ollama_reachable; then
+		log_error "Ollama is not reachable at $OLLAMA_URL."
+		log_error "Start it first, then re-run:  ollama serve"
+		return 1
+	fi
+
+	# Ensure a venv from the SAME demo/requirements.txt that ships to DO.
+	if [ ! -x "$VENV/bin/python" ]; then
+		if ! command -v python3 >/dev/null 2>&1; then
+			log_error "python3 not found — install Python 3 to run the demo app."
+			return 1
+		fi
+		log_info "Creating venv at $VENV"
+		if ! python3 -m venv "$VENV"; then
+			log_error "failed to create venv at $VENV"
+			return 1
+		fi
+	fi
+	log_info "Installing demo app dependencies (demo/requirements.txt)"
+	if ! PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV/bin/python" -m pip install -q -r "$REPO_ROOT/demo/requirements.txt"; then
+		log_error "pip install failed"
+		return 1
+	fi
+
+	# Launch Flask detached with APP_ENV=LOCAL; capture output to the log file
+	# and record the pid so `local down` can stop it.
+	mkdir -p "$STATE_DIR"
+	log_info "Starting demo app (APP_ENV=LOCAL) — logs at $LOG_FILE"
+	APP_ENV=LOCAL "$VENV/bin/python" "$REPO_ROOT/demo/app.py" >"$LOG_FILE" 2>&1 &
+	app_pid=$!
+	echo "$app_pid" >"$PID_FILE"
+
+	# Not healthy = not Done. Wait for /health, else tear down and report.
+	if ! _wait_health; then
+		log_error "demo app did not become healthy — see $LOG_FILE"
+		kill "$app_pid" 2>/dev/null || true
+		rm -f "$PID_FILE"
+		return 1
+	fi
+
+	log_info "demo app healthy at $LOCAL_URL (pid $app_pid)"
+	_open_browser
+	# stdout carries the URL only (data), per the logging convention.
+	echo "$LOCAL_URL"
+}
+
+cmd_local_down() {
+	if [ ! -f "$PID_FILE" ]; then
+		echo "digital-ocean local: not running."
+		return 0
+	fi
+	pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+	if _alive "$pid"; then
+		log_info "Stopping demo app (pid $pid)."
+		kill "$pid" 2>/dev/null || true
+		# Give it a moment to exit; escalate if it clings on.
+		tries=0
+		while _alive "$pid" && [ "$tries" -lt 20 ]; do
+			sleep 0.2
+			tries=$((tries + 1))
+		done
+		if _alive "$pid"; then
+			log_debug "pid $pid still alive; sending SIGKILL"
+			kill -9 "$pid" 2>/dev/null || true
+		fi
+		rm -f "$PID_FILE"
+		echo "digital-ocean local: stopped."
+	else
+		rm -f "$PID_FILE"
+		echo "digital-ocean local: not running (removed stale pid file)."
+	fi
+	return 0
+}
+
+# --- Dispatch ----------------------------------------------------------------
+
 main() {
+	# Leading global flags, then dispatch on the first non-flag as a command.
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		-h | --help)
@@ -53,23 +219,44 @@ main() {
 			;;
 		-v | --verbose)
 			LOG_LEVEL=DEBUG
+			shift
 			;;
-		*)
+		--)
+			shift
+			break
+			;;
+		-*)
 			log_error "unknown argument: $1"
 			usage >&2
 			return 2
 			;;
+		*)
+			break
+			;;
 		esac
-		shift
 	done
 
-	log_info "Starting digital-ocean."
-	log_debug "Log level: $LOG_LEVEL"
+	if [ $# -eq 0 ]; then
+		# No command — keep the skeleton banner (used by F1's smoke tests).
+		log_info "Starting digital-ocean."
+		log_debug "Log level: $LOG_LEVEL"
+		echo "digital-ocean control CLI. Run with --help for usage."
+		log_info "Done."
+		return 0
+	fi
 
-	# Real output/data goes to stdout; progress/diagnostics go to stderr above.
-	echo "digital-ocean control CLI — skeleton. Run with --help for usage."
-
-	log_info "Done."
+	subcommand="$1"
+	shift
+	case "$subcommand" in
+	local)
+		cmd_local "$@"
+		;;
+	*)
+		log_error "unknown command: $subcommand"
+		usage >&2
+		return 2
+		;;
+	esac
 }
 
 main "$@"

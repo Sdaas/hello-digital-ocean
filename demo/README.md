@@ -45,14 +45,22 @@ The `demo` app needs no third-party credentials (the file may be empty/absent).
 
 ## Run it locally
 
-The supported entry point is `digital-ocean local` (feature F3). To run the app
-directly for development:
+The supported entry point is **`digital-ocean local`** (feature F3). It builds a
+venv from this `requirements.txt`, asserts local Ollama is up, starts Flask with
+`APP_ENV=LOCAL`, waits for `/health`, and opens the browser:
+
+```sh
+ollama serve &            # if not already running
+ollama pull llama3.2:1b   # once
+digital-ocean local       # build venv, start app, open http://127.0.0.1:5000
+digital-ocean local down  # stop it
+```
+
+To run the app directly for development instead:
 
 ```sh
 python3 -m venv .venv && . .venv/bin/activate
 pip install -r demo/requirements.txt
-ollama serve &            # if not already running
-ollama pull llama3.2:1b   # once
 APP_ENV=LOCAL python3 demo/app.py
 # open http://127.0.0.1:5000
 ```

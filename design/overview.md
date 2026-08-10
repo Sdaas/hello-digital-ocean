@@ -40,6 +40,15 @@ This file remains the home for design notes that emerge during per-feature
 - **Demo app history (F2):** a single shared conversation persisted as **JSONL**
   (`APP_DATA_DIR/history.jsonl`), appended per turn and reloaded on start so it
   survives a `stop`/restart. Malformed lines are skipped defensively.
+- **`digital-ocean local` (F3):** the first *real* subcommand — it introduces a
+  small **subcommand dispatcher** in `bin/digital-ocean` that F4–F9 extend. It
+  runs the demo app on the Mac from the **same `demo/requirements.txt`** (venv at
+  repo-root `.venv/`), **fails fast** if local Ollama is unreachable (before
+  building the venv), launches Flask **detached** (`APP_ENV=LOCAL`; pid + captured
+  log at `demo/.localdata/local.{pid,log}`), waits for `/health`, then opens the
+  browser. `digital-ocean local down` stops it via the pid file. Bats caveat
+  worth remembering: a mid-test `[[ ]]` failure is silently ignored, so
+  output-substring assertions use `grep -q`.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
