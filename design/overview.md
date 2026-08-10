@@ -34,6 +34,17 @@ This file remains the home for design notes that emerge during per-feature
 - Logging: leveled logging — INFO (default) and DEBUG (via `--verbose`), ERROR
   always — to **stderr** (stdout stays data-only), ISO-8601 UTC timestamps. The
   entry point ships with `log_*` / `logging` / `console` helpers demonstrating it.
+- **Demo app (F2):** the only runtime dependency is **Flask** — the Ollama client
+  is hand-rolled on the stdlib (`urllib`), keeping the deploy/venv lean (ADR-ethos:
+  fewest moving parts). Replies are non-streaming.
+- **Demo app history (F2):** a single shared conversation persisted as **JSONL**
+  (`APP_DATA_DIR/history.jsonl`), appended per turn and reloaded on start so it
+  survives a `stop`/restart. Malformed lines are skipped defensively.
+- **Python test lane (F2):** the demo app's `pytest` suite is wired into
+  `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
+  Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
+  self-skipping real-Ollama test under `tests/integration/` (run by
+  `./test.sh --integration`); CI installs the demo deps and runs the fast lane.
 
 ## Constraints
 

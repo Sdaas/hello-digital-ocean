@@ -1,0 +1,4 @@
+# demo app — runtime dependencies (see architecture/components.md COMP-3).
+# Deliberately minimal: the Ollama client is hand-rolled on the stdlib (ADR-ethos:
+# fewest moving parts), so Flask is the only runtime dependency.
+Flask>=3.0,<4.0
