@@ -135,7 +135,9 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "provision writes state file with private (0600) perms" {
 	run $DO provision
 	[ "$status" -eq 0 ]
-	perms="$(stat -f '%Lp' "$CONFIG_DIR/state" 2>/dev/null || stat -c '%a' "$CONFIG_DIR/state")"
+	# GNU stat (-c, Linux/CI) first; fall back to BSD stat (-f, macOS). The old
+	# order broke on Linux: GNU `stat -f` doesn't error, so the fallback never ran.
+	perms="$(stat -c '%a' "$CONFIG_DIR/state" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/state")"
 	[ "$perms" = "600" ]
 }
 
