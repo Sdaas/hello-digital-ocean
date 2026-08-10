@@ -60,6 +60,28 @@ This file remains the home for design notes that emerge during per-feature
   idempotent. The creds file is `touch`ed (may be empty, ADR-0005). The doctl
   boundary is stubbed on `PATH` in the fast lane, which obligates the opt-in,
   self-skipping real-`doctl` test in `tests/integration/setup.bats`.
+- **Provisioning scripts (F5):** two **self-contained** Ubuntu bash scripts —
+  `infra/provision-cpu.sh` (apt `python3-venv/pip` → format-if-empty + mount data
+  volume → venv + `pip install -r demo/requirements.txt`) and
+  `infra/provision-gpu.sh` (**assert** NVIDIA driver → mount models volume →
+  install Ollama). Run as root **over SSH** by F7 (ADR-0002); the CLI never
+  shares code with them. Configured by **env vars with ADR defaults**
+  (sourceable). Idempotent throughout (re-run skips completed steps). Key design
+  points learned from DO/Ollama docs: (1) volumes mount **by device-path**
+  `/dev/disk/by-id/scsi-0DO_Volume_<name>` with DO's exact opts
+  `defaults,nofail,discard,noatime 0 2` in `/etc/fstab` (not UUID), and are
+  **formatted only when unformatted** (never reformat — persistence across
+  `stop`, ADR-0001/0003); (2) the GPU driver ships on DO's AI/ML image but can be
+  finalized by cloud-init at first boot, so the assertion is a **bounded poll**
+  of `nvidia-smi` (`NVIDIA_WAIT_SECS`, default 120) — it does **not** install
+  drivers (F5 scope); (3) Ollama is pointed at `/mnt/models` and bound
+  `0.0.0.0:11434` via a systemd **drop-in** override with `chown ollama:ollama`
+  on the volume. F5 stops at "deps installed" — **model pull (C8) and firewalling
+  are F7**. The apt/venv/pip/Ollama/nvidia boundaries are PATH-shimmed in the fast
+  bats lane, which obligates the opt-in `tests/integration/provision.bats` that
+  runs both scripts in a real `ubuntu:22.04` Docker container (self-skips without
+  `docker`); the volume-mount **positive path** and GPU-**present** path can only
+  be exercised on a real droplet, so their un-mocked VERIFY is **deferred to F7**.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
