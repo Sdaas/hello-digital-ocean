@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#
+# pre-push hook — block the push if the test suite fails.
+# Installed by ./install-hooks.sh.
+
+set -uo pipefail
+
+# Run the FULL lane before a push, including integration (real-boundary) tests.
+# The integration lane's home is local — CI can't provide its boundaries — so
+# this hook is where it runs automatically. Integration tests self-skip when
+# their boundary is absent, so this stays non-blocking when e.g. a service is
+# down. Profiles without an integration lane simply ignore the flag.
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+echo "pre-push: running ./test.sh --integration ..."
+if ! "$REPO_ROOT/test.sh" --integration; then
+	echo "pre-push: tests failed — push aborted. Use 'git push --no-verify' to override." >&2
+	exit 1
+fi
+echo "pre-push: tests passed — proceeding."
+exit 0

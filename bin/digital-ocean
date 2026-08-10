@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+#
+# digital-ocean — control CLI for the DigitalOcean demo host.
+#
+# This is the MAIN ARTIFACT of the hello-digital-ocean repo: a Mac-side control
+# CLI that provisions and tears down the DigitalOcean infrastructure (droplets +
+# volumes) and runs the reference "demo" app on it — e.g. `digital-ocean start`,
+# `digital-ocean stop`, `digital-ocean setup`, `digital-ocean destroy`,
+# `digital-ocean local`. Those subcommands are added by later features (F3–F9);
+# this skeleton ships the CLI framework (--help/--verbose, strict mode, leveled
+# logging) that they build on.
+#
+# Written to run under both bash and zsh: avoids bash-only features
+# (no arrays, no ${BASH_SOURCE}). Keep it that way.
+
+set -eu
+
+# --- Logging (see design/overview.md) ---------------------------------------
+# Leveled logging to STDERR so stdout carries only real output/data. Two levels
+# the user selects: INFO (default) and DEBUG (via --verbose); ERROR is always
+# emitted. Each line is "<ISO-8601 UTC> <LEVEL> digital-ocean: <message>".
+LOG_LEVEL=INFO
+
+log() { # log LEVEL message...
+	level="$1"
+	shift
+	# DEBUG lines only appear when the user asked for --verbose.
+	if [ "$level" = DEBUG ] && [ "$LOG_LEVEL" != DEBUG ]; then
+		return 0
+	fi
+	printf '%s %s digital-ocean: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$level" "$*" >&2
+}
+log_debug() { log DEBUG "$@"; }
+log_info() { log INFO "$@"; }
+log_error() { log ERROR "$@"; }
+
+usage() {
+	cat <<EOF
+Usage: digital-ocean [--help] [--verbose]
+
+Control CLI for the DigitalOcean demo host — provisions/tears down the DO
+infrastructure and runs the reference "demo" app on it. Subcommands
+(setup/start/stop/destroy/local/ssh/logs/status) are added in later features.
+EOF
+}
+
+main() {
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		-h | --help)
+			usage
+			return 0
+			;;
+		-v | --verbose)
+			LOG_LEVEL=DEBUG
+			;;
+		*)
+			log_error "unknown argument: $1"
+			usage >&2
+			return 2
+			;;
+		esac
+		shift
+	done
+
+	log_info "Starting digital-ocean."
+	log_debug "Log level: $LOG_LEVEL"
+
+	# Real output/data goes to stdout; progress/diagnostics go to stderr above.
+	echo "digital-ocean control CLI — skeleton. Run with --help for usage."
+
+	log_info "Done."
+}
+
+main "$@"

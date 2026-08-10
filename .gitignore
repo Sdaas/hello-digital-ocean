@@ -1,0 +1,9 @@
+# temp / scratch
+*.tmp
+.DS_Store
+
+# in-flight SDLC session checkpoint (machine-local; see sdlc-common §5)
+SESSION_STATE.md
+
+# local env
+.env
