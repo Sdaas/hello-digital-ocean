@@ -7,7 +7,7 @@
 - [x] `/sdlc-discovery` — concept + use cases (UC1–UC7) **approved**
 - [x] `/sdlc-architecture` — overview + 7 ADRs + backlog **approved**
 - [x] `/sdlc-newproject` — repo scaffolded, first commit pushed, backlog seeded **done** (2026-08-10)
-- [~] `/sdlc-feature` — build backlog: **F2 (#1) done** (2026-08-10); **next up: F3 (#2)**
+- [~] `/sdlc-feature` — build backlog: **F2 (#1), F3 (#2), F4 (#3) done** (2026-08-10); **next up: F5 (#4)**
 
 Repo: https://github.com/Sdaas/hello-digital-ocean (public, MIT).
 
@@ -22,8 +22,8 @@ Repo: https://github.com/Sdaas/hello-digital-ocean (public, MIT).
 |---|---|---|---|---|---|
 | F1 | — | Repo scaffold + `digital-ocean` CLI skeleton | P0 | — | **done** |
 | F2 | #1 | `demo` app (Flask+history+Ollama+UI+`APP_ENV`) | P0 | F1 | **done** |
-| F3 | #2 | `digital-ocean local` — run on the Mac | P0 | F1,F2 | todo |
-| F4 | #3 | `digital-ocean setup` — preflight + interview + config | P0 | F1 | todo |
+| F3 | #2 | `digital-ocean local` — run on the Mac | P0 | F1,F2 | **done** |
+| F4 | #3 | `digital-ocean setup` — preflight + interview + config | P0 | F1 | **done** |
 | F5 | #4 | Provisioning scripts (Ubuntu) | P0 | F2 | todo |
 | F6 | #5 | DO resources (volumes, droplets, VPC) | P0 | F4 | todo |
 | F7 | #6 | `digital-ocean start` orchestration (end-to-end) | P0 | F5,F6,F2 | todo |
@@ -48,5 +48,5 @@ Fixed ~$6/mo (volumes) + ~$0.80/hr while running. Always `stop` after a demo.
 Backlog seeded as GitHub Issues **#1–#9** (F2–F10) with `Depends on:` links —
 see https://github.com/Sdaas/hello-digital-ocean/issues. Build order is
 local-first then cloud bottom-up: F2 (#1) → F3 (#2) → F4 (#3) → F5 (#4) →
-F6 (#5) → F7 (#6) → F8 (#7), then P1 F9 (#8), F10 (#9). F2 (#1) is built;
-start the next capability with `/sdlc-feature #2`.
+F6 (#5) → F7 (#6) → F8 (#7), then P1 F9 (#8), F10 (#9). F2–F4 are built;
+start the next capability with `/sdlc-feature #4`.

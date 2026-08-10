@@ -8,6 +8,9 @@ SESSION_STATE.md
 # local env
 .env
 
+# digital-ocean setup (F4) — local config + credentials (machine-local, never commit)
+.do/
+
 # demo app (Python) — local runtime data + tool caches
 demo/.localdata/
 __pycache__/

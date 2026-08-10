@@ -34,6 +34,12 @@ LOCAL_URL="http://127.0.0.1:5000"
 # Local Ollama endpoint (matches the demo app's OLLAMA_URL default).
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 
+# Where `setup` (F4) writes the local config. Repo-local and gitignored;
+# overridable so tests point it at a throwaway dir. The cloud commands (F6/F7)
+# read this file. Env-style KEY=value (sourceable — no jq dependency).
+CONFIG_DIR="${DO_CONFIG_DIR:-$REPO_ROOT/.do}"
+CONFIG_FILE="$CONFIG_DIR/config"
+
 # --- Logging (see design/overview.md) ---------------------------------------
 # Leveled logging to STDERR so stdout carries only real output/data. Two levels
 # the user selects: INFO (default) and DEBUG (via --verbose); ERROR is always
@@ -61,10 +67,12 @@ Control CLI for the DigitalOcean demo host — provisions/tears down the DO
 infrastructure and runs the reference "demo" app on it.
 
 Commands:
+  setup            One-time local preflight + interview → write local config.
+  setup --non-interactive   Same, no prompts (accept defaults / env overrides).
   local            Run the demo app on this Mac (venv + Flask + browser).
   local down       Stop the locally running demo app.
 
-Cloud commands (setup/start/stop/destroy/ssh/logs/status) are added in later
+Other cloud commands (start/stop/destroy/ssh/logs/status) are added in later
 features. With no command, prints a short banner.
 EOF
 }
@@ -207,6 +215,174 @@ cmd_local_down() {
 	return 0
 }
 
+# --- `digital-ocean setup` (F4) ---------------------------------------------
+# Local-only: preflight checks, an interview (skippable with --non-interactive),
+# and a write of the local config file. Creates ZERO billable resources — the
+# only DO calls are read-only (`doctl account get`, `compute ssh-key list`).
+
+# Emit a `KEY='value'` config line with POSIX-safe single-quote escaping, so a
+# value containing a quote can't corrupt the file or break the next run's source.
+_kv() { # key value
+	esc="$(printf '%s' "$2" | sed "s/'/'\\\\''/g")"
+	printf "%s='%s'\n" "$1" "$esc"
+}
+
+# Report a required local tool. Missing tools accumulate into _setup_fail.
+_check_tool() { # name install-hint
+	if command -v "$1" >/dev/null 2>&1; then
+		log_info "preflight: $1 found"
+	else
+		log_error "preflight: $1 not found — $2"
+		_setup_fail=1
+	fi
+}
+
+# Resolve the local SSH private key. DO_SSH_KEY_FILE, when set, is authoritative
+# (used exactly, no fallback) so tests are deterministic; otherwise scan the
+# usual ~/.ssh candidates. Echoes the path; non-zero if none found.
+_local_ssh_key() {
+	if [ -n "${DO_SSH_KEY_FILE:-}" ]; then
+		printf '%s' "$DO_SSH_KEY_FILE"
+		return 0
+	fi
+	for f in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+		if [ -f "$f" ]; then
+			printf '%s' "$f"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Resolve one config field. Precedence: explicit env override > (already-sourced)
+# stored config / hardcoded default. Prompts only when interactive and no env
+# override was given. Echoes the chosen value.
+_field() { # envval default label
+	if [ -n "$1" ]; then
+		printf '%s' "$1"
+		return 0
+	fi
+	if [ "$NONINTERACTIVE" = 1 ]; then
+		printf '%s' "$2"
+		return 0
+	fi
+	printf '%s [%s]: ' "$3" "$2" >&2
+	if IFS= read -r reply && [ -n "$reply" ]; then
+		printf '%s' "$reply"
+	else
+		printf '%s' "$2"
+	fi
+}
+
+cmd_setup() {
+	NONINTERACTIVE=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--non-interactive | -y)
+			NONINTERACTIVE=1
+			shift
+			;;
+		*)
+			log_error "unknown argument to 'setup': $1"
+			usage >&2
+			return 2
+			;;
+		esac
+	done
+
+	# Capture explicit env overrides BEFORE sourcing the stored config (which
+	# would otherwise clobber them).
+	env_region="${DO_REGION:-}"
+	env_cpu="${DO_CPU_SIZE:-}"
+	env_gpu="${DO_GPU_SIZE:-}"
+	env_model="${OLLAMA_MODEL:-}"
+	env_keyname="${DO_SSH_KEY_NAME:-}"
+	env_creds="${APP_CREDENTIALS_FILE:-}"
+
+	# --- preflight (accumulate ALL failures, then hard-fail) ----------------
+	log_info "Running preflight checks (local only — nothing is provisioned)."
+	_setup_fail=0
+	_check_tool doctl "install doctl: https://docs.digitalocean.com/reference/doctl/how-to/install/"
+	_check_tool ssh "install OpenSSH (ssh)"
+	_check_tool scp "install OpenSSH (scp)"
+	_check_tool curl "install curl"
+
+	# DO auth + a registered key — only worth probing when doctl is present.
+	do_key_name=""
+	if command -v doctl >/dev/null 2>&1; then
+		if doctl account get >/dev/null 2>&1; then
+			log_info "preflight: DigitalOcean auth OK (doctl account get)"
+		else
+			log_error "preflight: doctl is not authenticated — run: doctl auth init"
+			_setup_fail=1
+		fi
+		do_key_name="$(doctl compute ssh-key list --format Name --no-header 2>/dev/null | head -n1)"
+		if [ -n "$do_key_name" ]; then
+			log_info "preflight: DO-registered SSH key '$do_key_name'"
+		else
+			log_error "preflight: no DO-registered SSH key — import one: doctl compute ssh-key import <name> --public-key-file ~/.ssh/id_ed25519.pub"
+			_setup_fail=1
+		fi
+	fi
+
+	# Local SSH private key.
+	keyfile="$(_local_ssh_key || true)"
+	if [ -n "$keyfile" ] && [ -f "$keyfile" ]; then
+		log_info "preflight: local SSH key $keyfile"
+	else
+		log_error "preflight: no local SSH key found — generate one: ssh-keygen -t ed25519"
+		_setup_fail=1
+	fi
+
+	if [ "$_setup_fail" -ne 0 ]; then
+		log_error "preflight failed — fix the items above and re-run 'digital-ocean setup'. No config written."
+		return 1
+	fi
+	log_info "preflight passed."
+
+	# --- interview ----------------------------------------------------------
+	# Source any existing config so its values seed the interview defaults.
+	if [ -f "$CONFIG_FILE" ]; then
+		log_debug "loading existing config $CONFIG_FILE"
+		# shellcheck disable=SC1090
+		. "$CONFIG_FILE"
+	fi
+
+	region="$(_field "$env_region" "${DO_REGION:-ams3}" "DigitalOcean region")"
+	cpu="$(_field "$env_cpu" "${DO_CPU_SIZE:-s-2vcpu-4gb}" "CPU droplet size")"
+	gpu="$(_field "$env_gpu" "${DO_GPU_SIZE:-gpu-4000adax1-20gb}" "GPU droplet size")"
+	model="$(_field "$env_model" "${OLLAMA_MODEL:-llama3.2:1b}" "Ollama model")"
+	key_name="$(_field "$env_keyname" "${DO_SSH_KEY_NAME:-$do_key_name}" "DO SSH key name")"
+	creds="$(_field "$env_creds" "${APP_CREDENTIALS_FILE:-$CONFIG_DIR/credentials}" "Local credentials file")"
+
+	# Ensure the credentials file exists (may be empty — ADR-0005).
+	credsdir="$(dirname "$creds")"
+	mkdir -p "$credsdir"
+	[ -f "$creds" ] || : >"$creds"
+
+	# --- write config (atomic, private perms) -------------------------------
+	mkdir -p "$CONFIG_DIR"
+	old_umask="$(umask)"
+	umask 077
+	tmp="$CONFIG_FILE.tmp.$$"
+	{
+		printf '# digital-ocean config — written by "digital-ocean setup" (F4). Gitignored; do not commit.\n'
+		_kv DO_REGION "$region"
+		_kv DO_CPU_SIZE "$cpu"
+		_kv DO_GPU_SIZE "$gpu"
+		_kv OLLAMA_MODEL "$model"
+		_kv DO_SSH_KEY_NAME "$key_name"
+		_kv APP_CREDENTIALS_FILE "$creds"
+	} >"$tmp"
+	mv "$tmp" "$CONFIG_FILE"
+	umask "$old_umask"
+
+	log_info "Wrote config to $CONFIG_FILE"
+	log_info "Setup complete. Next: 'digital-ocean start' provisions the demo (billable)."
+	# stdout carries the config path only (data), per the logging convention.
+	echo "$CONFIG_FILE"
+}
+
 # --- Dispatch ----------------------------------------------------------------
 
 main() {
@@ -248,6 +424,9 @@ main() {
 	subcommand="$1"
 	shift
 	case "$subcommand" in
+	setup)
+		cmd_setup "$@"
+		;;
 	local)
 		cmd_local "$@"
 		;;

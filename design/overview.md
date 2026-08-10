@@ -49,6 +49,17 @@ This file remains the home for design notes that emerge during per-feature
   browser. `digital-ocean local down` stops it via the pid file. Bats caveat
   worth remembering: a mid-test `[[ ]]` failure is silently ignored, so
   output-substring assertions use `grep -q`.
+- **`digital-ocean setup` (F4):** local-only preflight + interview + config write;
+  **creates zero billable resources** (only read-only `doctl account get` /
+  `compute ssh-key list`). Preflight **accumulates all failures** then **hard-fails
+  (exit 1, no config written)** with a fix hint per item. Config is **env-style
+  `KEY=value`** at repo-local **`.do/config`** (gitignored, written `0600`,
+  sourceable — no `jq` dependency); `DO_CONFIG_DIR` overrides the location for
+  tests. Per-key resolution is **env override > stored config > hardcoded
+  default**, so `--non-interactive` + env vars drive it headlessly and re-runs are
+  idempotent. The creds file is `touch`ed (may be empty, ADR-0005). The doctl
+  boundary is stubbed on `PATH` in the fast lane, which obligates the opt-in,
+  self-skipping real-`doctl` test in `tests/integration/setup.bats`.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
