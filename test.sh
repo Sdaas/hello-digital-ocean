@@ -35,7 +35,7 @@ FAILED=0
 
 echo "==> shellcheck"
 if command -v shellcheck >/dev/null 2>&1; then
-	if shellcheck bin/digital-ocean infra/provision-cpu.sh infra/provision-gpu.sh test.sh release.sh setup.sh install-hooks.sh hooks/pre-push; then
+	if shellcheck bin/digital-ocean infra/provision-cpu.sh infra/provision-gpu.sh infra/provision-ollama-cpu.sh test.sh release.sh setup.sh install-hooks.sh hooks/pre-push; then
 		echo "    clean"
 	else
 		echo "    shellcheck FAILED"

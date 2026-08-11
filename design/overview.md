@@ -128,6 +128,34 @@ This file remains the home for design notes that emerge during per-feature
   self-skipping `tests/integration/do-start.bats` (`DO_REAL_START=1`) **plus a billable
   live VERIFY** (the un-mocked GPU/ssh/Ollama evidence F5/F6 deferred here). **F8 handoff:**
   `stop`/`destroy` should also clean up the two firewalls.
+- **Selectable Ollama backend + private-IP isolation (#18/#19):** `setup` records
+  **`OLLAMA_BACKEND=cpu|gpu`** (default **cpu** — the demo runs GPU-free) and
+  **`DO_ENABLE_FIREWALL=0|1`** (default **0**). Topology is unchanged either way
+  (2 droplets + VPC); only the **Ollama node** varies — a CPU droplet
+  (`DO_OLLAMA_CPU_SIZE`, default **`s-8vcpu-16gb-amd`**, sized for an 8B Q4 model + KV
+  cache, provisioned by new **`infra/provision-ollama-cpu.sh`**) or a GPU droplet
+  (`DO_GPU_SIZE`, existing `provision-gpu.sh`; #17 owns its driver work). The
+  `.do/state` keys stay **`DO_GPU_*`** for the Ollama node regardless of backend
+  (no rename — avoids rippling through F6/F7). `cmd_start` branches on
+  `OLLAMA_BACKEND` at exactly two points: the Ollama droplet's **size** and which
+  **provision script** runs over SSH; everything downstream is backend-agnostic.
+  **Ollama isolation is now the private-IP bind** (`OLLAMA_HOST=<node_private_ip>:11434`,
+  from state — not `0.0.0.0`), so :11434 is off the public net with **no firewall,
+  on the current non-firewall-scoped token** (ADR-0007 amended, #19). `ollama pull`
+  runs with the same `OLLAMA_HOST`. The firewall block is gated behind
+  `DO_ENABLE_FIREWALL` (default off, skipped); with `=1` the existing VPC-scoped
+  firewall path runs, and if the token lacks firewall scope it **hard-fails**
+  (points at #16). New CPU-provision boundary (apt/ollama) is PATH-shimmed in the
+  fast lane (`tests/provision-ollama-cpu.bats`), obligating the opt-in Docker
+  integration test; the CPU live end-to-end (Ollama off the public IP, chat works)
+  is the **first real VERIFY of F5+F6+F7**, on cents/hr CPU (GPU path stays
+  hermetic-tested here, live-VERIFY'd with #17). **Region constraint (found at
+  VERIFY, flagged to #17):** the CPU-8B node needs a 16 GB droplet
+  (`s-8vcpu-16gb-amd`), which exists in **ams3** but **not tor1** (tor1's standard
+  droplets top out at `s-4vcpu-8gb`/8 GB). Since #17 retargets the *GPU* to tor1,
+  region must become **backend-aware** (cpu→a 16 GB region like ams3; gpu→tor1) —
+  a naive tor1 default would break the default CPU-8B backend. #18 leaves the
+  region default (ams3) unchanged; #17 owns the retarget + this constraint.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
