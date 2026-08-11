@@ -75,9 +75,11 @@ Commands:
   setup --non-interactive   Same, no prompts (accept defaults / env overrides).
   local            Run the demo app on this Mac (venv + Flask + browser).
   local down       Stop the locally running demo app.
+  start            Provision DO infra + deploy the demo end-to-end (BILLABLE);
+                   prints the public URL and ssh commands when healthy.
 
-Other cloud commands (start/stop/destroy/ssh/logs/status) are added in later
-features. With no command, prints a short banner.
+Other cloud commands (stop/destroy/ssh/logs/status) are added in later features.
+With no command, prints a short banner.
 EOF
 }
 
@@ -487,6 +489,9 @@ write_state() {
 		_kv DO_GPU_DROPLET_ID "${DO_GPU_DROPLET_ID:-}"
 		_kv DO_GPU_PUBLIC_IP "${DO_GPU_PUBLIC_IP:-}"
 		_kv DO_GPU_PRIVATE_IP "${DO_GPU_PRIVATE_IP:-}"
+		# Firewall IDs are set by F7 `start` (empty on a bare F6 provision).
+		_kv DO_CPU_FW_ID "${DO_CPU_FW_ID:-}"
+		_kv DO_GPU_FW_ID "${DO_GPU_FW_ID:-}"
 	} >"$tmp"
 	mv "$tmp" "$DO_STATE_FILE"
 	umask "$old_umask"
@@ -630,6 +635,214 @@ cmd_deprovision() {
 	log_info "deprovisioned droplets (volumes + VPC kept). State at $DO_STATE_FILE"
 }
 
+# --- `digital-ocean start` (F7) ---------------------------------------------
+# The public end-to-end orchestration: provision (reuse F6) → firewalls → wait for
+# SSH → sync code → run F5 provision scripts over SSH → ollama pull → scp creds →
+# deploy the F2 demo app as a systemd unit (APP_ENV=DO_DEMO, private Ollama URL) →
+# health checks → print the public URL + ready-to-paste ssh commands. Idempotent:
+# a re-run adopts every resource, re-syncs, and restarts the service.
+
+# Where `start` pins droplet host keys (accept-new on first connect, then verify).
+KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
+# Waits (overridable so tests run fast). SSH: fresh droplets take a bit to boot.
+DO_SSH_WAIT_SECS="${DO_SSH_WAIT_SECS:-180}"
+DO_HEALTH_WAIT_SECS="${DO_HEALTH_WAIT_SECS:-120}"
+
+# Standard SSH options: batch (never prompt), accept-new host keys into our pinned
+# known_hosts, and a bounded connect timeout. A resolved local key is added if we
+# find one; otherwise we fall back to the agent/default identities.
+_ssh_opts() {
+	printf '%s' "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10"
+	keyfile="$(_local_ssh_key || true)"
+	[ -n "$keyfile" ] && printf ' %s' "-i $keyfile"
+}
+
+# _ssh HOST REMOTE-COMMAND — run one (single-line) command as root on HOST.
+# The unquoted $(_ssh_opts) is deliberate: it must word-split into separate ssh
+# flags, and this file avoids arrays (runs under bash and zsh). $2 expands on the
+# client (SC2029) by design — the remote command is built only from our own vars.
+_ssh() { # host command
+	# shellcheck disable=SC2046,SC2086,SC2029
+	ssh $(_ssh_opts) "root@$1" "$2"
+}
+
+# _scp LOCAL HOST:REMOTE — copy a local file to a droplet.
+_scp() { # local remote
+	# shellcheck disable=SC2046,SC2086
+	scp $(_ssh_opts) "$1" "$2"
+}
+
+# _rsync LOCAL... HOST:DIR — sync local trees to a droplet over ssh. Excludes the
+# Mac-local runtime cruft (venv, pycache, LOCAL run data) so only source ships.
+_rsync() { # local... remote
+	# shellcheck disable=SC2086
+	rsync -az --delete-excluded \
+		--exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' \
+		--exclude='.localdata' --exclude='.pytest_cache' \
+		-e "ssh $(_ssh_opts)" "$@"
+}
+
+# Poll until SSH answers on HOST, up to DO_SSH_WAIT_SECS. Fresh droplets need a
+# moment before sshd is up; a bad key or blocked port fails the whole start here.
+_wait_ssh() { # host
+	waited=0
+	mkdir -p "$CONFIG_DIR"
+	while true; do
+		if _ssh "$1" "true" >/dev/null 2>&1; then
+			log_info "ssh up on $1"
+			return 0
+		fi
+		if [ "$waited" -ge "$DO_SSH_WAIT_SECS" ]; then
+			log_error "ssh never became reachable on $1 after ${DO_SSH_WAIT_SECS}s"
+			return 1
+		fi
+		log_debug "waiting for ssh on $1 (${waited}s)"
+		sleep 1
+		waited=$((waited + 1))
+	done
+}
+
+# Ensure a DO cloud firewall named $1 with the given inbound rules exists (adopt by
+# name, else create). Outbound is allow-all — a firewall with NO outbound rules
+# blocks ALL egress, which would break apt/pip/ollama installs. Echoes the ID.
+FW_OUTBOUND_ALL="protocol:tcp,ports:all,address:0.0.0.0/0,address:::/0 protocol:udp,ports:all,address:0.0.0.0/0,address:::/0 protocol:icmp,address:0.0.0.0/0,address:::/0"
+ensure_firewall() { # name inbound-rules
+	id="$(doctl compute firewall list --format Name,ID --no-header 2>/dev/null | awk -v n="$1" '$1==n{print $2; exit}')"
+	if [ -n "$id" ]; then
+		log_info "firewall $1: adopting existing ($id)"
+	else
+		log_info "firewall $1: creating"
+		id="$(doctl compute firewall create --name "$1" \
+			--inbound-rules "$2" --outbound-rules "$FW_OUTBOUND_ALL" \
+			--format ID --no-header)"
+	fi
+	printf '%s' "$id"
+}
+
+# Assign droplet $2 to firewall $1 (idempotent — DO ignores a droplet already on it).
+# Hard-fails on error: a firewall that never took effect is a security gap (Ollama
+# left open / app unreachable), not something to log-and-continue past.
+assign_firewall() { # fw-id droplet-id
+	if ! doctl compute firewall add-droplets "$1" --droplet-ids "$2" >/dev/null 2>&1; then
+		log_error "could not assign droplet $2 to firewall $1"
+		return 1
+	fi
+}
+
+cmd_start() {
+	if [ $# -gt 0 ]; then
+		log_error "unknown argument to 'start': $1"
+		usage >&2
+		return 2
+	fi
+
+	# 1. Provision (reuse F6). This sets DO_* resource vars in our scope and writes
+	#    .do/state; its stdout (the state path) is data we don't want in start's.
+	if ! cmd_provision >/dev/null; then
+		return 1
+	fi
+	# Re-read state so IPs/IDs are explicit (and to decouple from provision internals).
+	# shellcheck disable=SC1090
+	. "$DO_STATE_FILE"
+
+	log_info "Securing with DO cloud firewalls (ADR-0007: only CPU:5000 public)."
+	# 2. Firewalls. CPU: app + ssh public. GPU: Ollama only from inside the VPC.
+	# The GPU rule MUST be scoped to the VPC range — if we can't resolve it, fail
+	# rather than fall back to a rule that would expose unauthenticated Ollama.
+	vpc_range="$(doctl vpcs get "$DO_VPC_ID" --format IPRange --no-header 2>/dev/null)"
+	if [ -z "$vpc_range" ]; then
+		log_error "could not resolve the VPC IP range for $DO_VPC_ID — refusing to open Ollama without it."
+		return 1
+	fi
+	DO_CPU_FW_ID="$(ensure_firewall "${DO_CPU_NAME}-fw" \
+		"protocol:tcp,ports:5000,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")"
+	DO_GPU_FW_ID="$(ensure_firewall "${DO_GPU_NAME}-fw" \
+		"protocol:tcp,ports:11434,address:$vpc_range protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")"
+	assign_firewall "$DO_CPU_FW_ID" "$DO_CPU_DROPLET_ID" || return 1
+	assign_firewall "$DO_GPU_FW_ID" "$DO_GPU_DROPLET_ID" || return 1
+	write_state
+
+	# 3. Wait for SSH on both droplets before touching them.
+	log_info "Waiting for SSH on both droplets."
+	_wait_ssh "$DO_CPU_PUBLIC_IP" || return 1
+	_wait_ssh "$DO_GPU_PUBLIC_IP" || return 1
+
+	# 4. Sync the app + provisioning scripts to /opt/app on both hosts.
+	log_info "Syncing demo/ + infra/ to /opt/app on both droplets."
+	_ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
+	_ssh "$DO_GPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
+	_rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_CPU_PUBLIC_IP:/opt/app/" || return 1
+	_rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_GPU_PUBLIC_IP:/opt/app/" || return 1
+
+	# 5. GPU: provision (F5), then pull the model (C8 — persists on /mnt/models).
+	log_info "Provisioning GPU droplet + pulling model '$OLLAMA_MODEL'."
+	_ssh "$DO_GPU_PUBLIC_IP" \
+		"MODELS_VOLUME_NAME=$DO_MODELS_VOLUME_NAME OLLAMA_HOST=0.0.0.0:11434 bash /opt/app/infra/provision-gpu.sh" || return 1
+	_ssh "$DO_GPU_PUBLIC_IP" "ollama pull $OLLAMA_MODEL" || return 1
+
+	# 6. CPU: provision (F5), copy creds (C9/ADR-0005), deploy the app (C10) as a
+	#    systemd unit wired to the GPU's PRIVATE Ollama URL (ADR-0007).
+	log_info "Provisioning CPU droplet + deploying the demo app."
+	_ssh "$DO_CPU_PUBLIC_IP" \
+		"DATA_VOLUME_NAME=$DO_DATA_VOLUME_NAME bash /opt/app/infra/provision-cpu.sh" || return 1
+	_ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /etc/app" || return 1
+	_scp "$APP_CREDENTIALS_FILE" "root@$DO_CPU_PUBLIC_IP:/etc/app/credentials" || return 1
+	_deploy_app "$DO_CPU_PUBLIC_IP" "$DO_GPU_PRIVATE_IP" || return 1
+
+	# 7. Health checks (C11): Ollama reachable over the PRIVATE IP from the CPU,
+	#    then the app answers /health. Not healthy = not Done.
+	log_info "Running health checks."
+	if ! _ssh "$DO_CPU_PUBLIC_IP" "curl -fsS --max-time 5 http://$DO_GPU_PRIVATE_IP:11434/api/tags >/dev/null"; then
+		log_error "Ollama not reachable at $DO_GPU_PRIVATE_IP:11434 from the CPU droplet (VPC/firewall?)."
+		return 1
+	fi
+	if ! _wait_app_health "$DO_CPU_PUBLIC_IP"; then
+		log_error "demo app health check never passed on $DO_CPU_PUBLIC_IP:5000"
+		return 1
+	fi
+
+	log_info "Demo is up."
+	# stdout carries the public URL + ready-to-paste ssh commands (data; ADR-0006).
+	echo "http://$DO_CPU_PUBLIC_IP:5000"
+	echo "ssh root@$DO_CPU_PUBLIC_IP   # CPU droplet (app)"
+	echo "ssh root@$DO_GPU_PUBLIC_IP   # GPU droplet (Ollama)"
+}
+
+# Write + enable the demo app's systemd unit on the CPU, wired to the GPU's private
+# Ollama URL. Kept a single ssh command (printf '%b' expands the \n escapes) so the
+# whole unit ships in one round-trip and logs on one line.
+_deploy_app() { # cpu-ip gpu-private-ip
+	unit='[Unit]\n'
+	unit="${unit}Description=hello-digital-ocean demo app\n"
+	unit="${unit}After=network-online.target\n\n"
+	unit="${unit}[Service]\n"
+	unit="${unit}Environment=APP_ENV=DO_DEMO\n"
+	unit="${unit}Environment=OLLAMA_URL=http://$2:11434\n"
+	unit="${unit}Environment=OLLAMA_MODEL=$OLLAMA_MODEL\n"
+	unit="${unit}Environment=APP_DATA_DIR=/mnt/data\n"
+	unit="${unit}Environment=APP_CREDENTIALS_FILE=/etc/app/credentials\n"
+	unit="${unit}ExecStart=/opt/app/.venv/bin/python /opt/app/demo/app.py\n"
+	unit="${unit}Restart=on-failure\n\n"
+	unit="${unit}[Install]\n"
+	unit="${unit}WantedBy=multi-user.target\n"
+	_ssh "$1" "printf '%b' '$unit' >/etc/systemd/system/app.service; systemctl daemon-reload; systemctl enable app.service; systemctl restart app.service"
+}
+
+# Poll the app's /health from inside the CPU droplet up to DO_HEALTH_WAIT_SECS.
+_wait_app_health() { # cpu-ip
+	waited=0
+	while true; do
+		if _ssh "$1" "curl -fsS --max-time 5 http://127.0.0.1:5000/health >/dev/null" 2>/dev/null; then
+			return 0
+		fi
+		if [ "$waited" -ge "$DO_HEALTH_WAIT_SECS" ]; then
+			return 1
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
+}
+
 # --- Dispatch ----------------------------------------------------------------
 
 main() {
@@ -676,6 +889,9 @@ main() {
 		;;
 	local)
 		cmd_local "$@"
+		;;
+	start)
+		cmd_start "$@"
 		;;
 	provision)
 		cmd_provision "$@"
