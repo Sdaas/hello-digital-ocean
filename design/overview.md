@@ -196,6 +196,19 @@ This file remains the home for design notes that emerge during per-feature
   un-mocked teardown is covered by the real create→adopt→**destroy** in
   `tests/integration/do-provision.bats`, with the full stop/destroy on real
   droplets folded into the billable live VERIFY.
+- **`digital-ocean ssh` / `logs` / `status` debug helpers (F9, #8):** thin read-side
+  companions to `start`. They **reuse F7's `_ssh`/`_ssh_opts` + pinned `.do/known_hosts`**
+  (`StrictHostKeyChecking=accept-new` — the non-interactive host-key handling C18 asks
+  for) and the `.do/state` IPs, so the user names a **role (`cpu|gpu`, default `cpu`)**,
+  never a host. `ssh` opens an interactive root shell (or runs a one-shot remote command,
+  `ssh gpu nvidia-smi`; a non-`cpu|gpu` first arg is a **target error**, not a silent
+  command, so a typo can't run on the default host); `logs` tails the service journal
+  (`cpu`→`app.service`, `gpu`→`ollama.service`; last 100 or `-f`); `status` reports
+  `systemctl is-active` + a health probe (`cpu`→`:5000/health`, `gpu`→`:11434/api/tags`),
+  **both nodes** when no role is given. No state file → "run `start` first" (non-zero).
+  The ssh boundary is PATH-shimmed in the fast lane (`tests/do-debug.bats`, asserting the
+  right IP + remote command per subcommand); the un-mocked evidence is folded into the
+  existing billable live VERIFY (`ssh gpu nvidia-smi` / `logs` / `status` on a real host).
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
