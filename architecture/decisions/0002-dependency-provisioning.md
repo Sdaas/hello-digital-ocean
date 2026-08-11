@@ -29,3 +29,14 @@ iterate on.**
 Maximizes debuggability and iteration speed (live output, re-run a single step)
 with no extra tooling — exactly what a demo we actively debug needs; a custom
 image can be added later purely to speed boots if provisioning stabilizes.
+
+## Amendment (#17, 2026-08-11) — the GPU driver is now a provisioned dependency
+The original scope assumed the GPU droplet boots a DO **AI/ML image that ships the
+NVIDIA driver**, so `provision-gpu.sh` only *asserted* `nvidia-smi`. That no longer
+holds: the only affordable launchable GPU (RTX 6000 Ada, tor1 — see ADR 0008) has
+**no public base image**; the sole GPU base image is H100-flavored. So the GPU node
+now boots a **plain `ubuntu-22-04-x64` image**, and `provision-gpu.sh` **installs
+the NVIDIA kernel driver itself** (via `ubuntu-drivers`) before the assertion. This
+is fully consistent with the Option 2 decision above — the driver simply becomes
+one more idempotent, SSH-provisioned dependency. The assertion is retained as the
+post-install health gate.

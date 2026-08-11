@@ -71,10 +71,11 @@ This file remains the home for design notes that emerge during per-feature
   `/dev/disk/by-id/scsi-0DO_Volume_<name>` with DO's exact opts
   `defaults,nofail,discard,noatime 0 2` in `/etc/fstab` (not UUID), and are
   **formatted only when unformatted** (never reformat — persistence across
-  `stop`, ADR-0001/0003); (2) the GPU driver ships on DO's AI/ML image but can be
-  finalized by cloud-init at first boot, so the assertion is a **bounded poll**
-  of `nvidia-smi` (`NVIDIA_WAIT_SECS`, default 120) — it does **not** install
-  drivers (F5 scope); (3) Ollama is pointed at `/mnt/models` and bound
+  `stop`, ADR-0001/0003); (2) the GPU driver was originally *asserted* via a
+  **bounded poll** of `nvidia-smi` (`NVIDIA_WAIT_SECS`, default 120), on the
+  assumption DO's AI/ML image ships it — **superseded by #17**, which installs the
+  driver on a plain Ubuntu image before the poll (see the #17 entry below); (3)
+  Ollama is pointed at `/mnt/models` and bound
   `0.0.0.0:11434` via a systemd **drop-in** override with `chown ollama:ollama`
   on the volume. F5 stops at "deps installed" — **model pull (C8) and firewalling
   are F7**. The apt/venv/pip/Ollama/nvidia boundaries are PATH-shimmed in the fast
@@ -150,12 +151,31 @@ This file remains the home for design notes that emerge during per-feature
   integration test; the CPU live end-to-end (Ollama off the public IP, chat works)
   is the **first real VERIFY of F5+F6+F7**, on cents/hr CPU (GPU path stays
   hermetic-tested here, live-VERIFY'd with #17). **Region constraint (found at
-  VERIFY, flagged to #17):** the CPU-8B node needs a 16 GB droplet
-  (`s-8vcpu-16gb-amd`), which exists in **ams3** but **not tor1** (tor1's standard
-  droplets top out at `s-4vcpu-8gb`/8 GB). Since #17 retargets the *GPU* to tor1,
-  region must become **backend-aware** (cpu→a 16 GB region like ams3; gpu→tor1) —
-  a naive tor1 default would break the default CPU-8B backend. #18 leaves the
-  region default (ams3) unchanged; #17 owns the retarget + this constraint.
+  VERIFY):** the CPU-16GB node needs `s-8vcpu-16gb-amd`, which **tor1 lacks**
+  (its standard droplets top out at 8 GB), while the affordable GPU is tor1-only —
+  so region must be **backend-aware**. #18 left the region default unchanged;
+  **#17 resolves it** (below).
+- **GPU backend + backend-aware region (#17):** makes the GPU path real and picks
+  regions by backend. A live `doctl` sweep found the only affordable launchable DO
+  GPU is the **RTX 6000 Ada (48 GB, $1.57/hr, tor1-only)**; blr1 has no GPU, ams3's
+  cheapest is a $4.41/hr H100. Since the H100-flavored base image is the *only*
+  public GPU image, the GPU node now boots **plain `ubuntu-22-04-x64`** and
+  `provision-gpu.sh` **installs the NVIDIA driver itself** (`ubuntu-drivers`,
+  idempotent, skip via `NVIDIA_INSTALL=0`) before the existing assert (ADR-0002
+  amended). **Region is now a pure function of the backend** (`_region_for_backend`,
+  ADR-0008): **cpu→blr1** (India-local, has the 16 GB node), **gpu→tor1**; an
+  explicit `DO_REGION` still overrides, and `setup` re-derives on every run so a
+  backend switch can't strand a stale region. Defaults retargeted: `DO_GPU_SIZE`
+  →`gpu-6000adax1-48gb`, `DO_GPU_IMAGE`→`ubuntu-22-04-x64`. The apt/NVIDIA install
+  is PATH-shimmed in the fast lane (marker-file driver model); the Docker
+  integration test keeps exercising the assert **negative** path un-mocked via
+  `NVIDIA_INSTALL=0`. **VERIFY status:** CPU@blr1 fully live-verified
+  (provision→chat→destroy, ~$0.20/hr) and it exposed+fixed a cross-region VPC
+  adoption bug (region-scoped VPC name, above). **GPU@tor1 live VERIFY is deferred
+  (#22):** the DO account's GPU limit is 0, so the RTX 6000 Ada droplet cannot yet
+  launch — the un-mocked driver-install VERIFY is owed pending a DO support quota
+  bump. A separate pre-existing gap (provision doesn't fail-fast on a failed
+  droplet create) was filed as #23.
 - **`digital-ocean stop` / `destroy` teardown (F8, #7):** the **public** teardown
   surface, replacing the old hidden `deprovision`. `stop` destroys the droplets +
   the two `start`-created firewalls but **keeps** volumes + VPC (compute billing

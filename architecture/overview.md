@@ -68,14 +68,14 @@ flowchart TB
     CLI -. runs .-> LOCALRUN
   end
 
-  subgraph DO["DigitalOcean — region (default AMS3)"]
+  subgraph DO["DigitalOcean — region is backend-aware (cpu→blr1, gpu→tor1)"]
     subgraph CPU["CPU Droplet (APP_ENV=DO_DEMO)"]
       APP["COMP-3: Flask backend + UI<br/>reads /etc/app/credentials"]
       PROVc["COMP-2: provision-cpu.sh"]
     end
-    subgraph GPU["GPU Droplet (RTX 4000 Ada)"]
+    subgraph GPU["Ollama node — CPU (default) or GPU (RTX 6000 Ada, tor1)"]
       OLL["Ollama :11434"]
-      PROVg["COMP-2: provision-gpu.sh"]
+      PROVg["COMP-2: provision-gpu.sh (installs NVIDIA driver)"]
     end
     VOLD[("Data Volume<br/>/mnt/data<br/>history + logs")]
     VOLM[("Models Volume<br/>/mnt/models<br/>ollama models")]
@@ -105,19 +105,37 @@ flowchart TB
 - **`digital-ocean stop` (UC3):** destroy droplets, keep volumes.
   **`digital-ocean destroy` (UC4):** also volumes + snapshots.
 
-## 5. Cost model
+## 5. Which region? (backend-aware — ADR 0008)
+You never pick a region directly — **the Ollama backend picks it**, because no
+single DO region can host both backends (verified live with `doctl`):
+
+- **`gpu` → `tor1` (Toronto).** The only *affordable, actually-launchable* DO GPU
+  is the RTX 6000 Ada (48 GB, $1.57/hr), and it is **tor1-only**. Bangalore has no
+  GPU at all; Amsterdam's cheapest GPU is an H100 at $4.41/hr.
+- **`cpu` → `blr1` (Bangalore).** The default (cheap) backend runs its Ollama on a
+  16 GB CPU droplet (`s-8vcpu-16gb-amd`). blr1 has it, is India-local, and costs
+  the same as Amsterdam — but **tor1 has no 16 GB droplet** (it tops out at 8 GB),
+  so the CPU backend cannot live in tor1.
+
+So a GPU demo accepts India→Toronto latency for an affordable GPU; the default CPU
+demo stays India-local. An explicit `DO_REGION` still overrides this.
+
+## 6. Cost model
 Two parts: **fixed** (volumes persist between demos) + **variable** (compute only
-while a demo runs, since `stop` destroys droplets — ADR 0001).
+while a demo runs, since `stop` destroys droplets — ADR 0001). Every deployment is
+a small **web droplet** plus one **Ollama node** whose size/region follow the
+backend.
 
-| Fixed (always billed) | | Variable (only while running) | |
+| Fixed (always billed) | | Variable — while running | |
 |---|---|---|---|
-| Models volume (50 GB) | $5/mo | CPU droplet (small, 4 GB) | ~$0.036/hr |
-| Data volume (10 GB, incl. logs) | $1/mo | GPU droplet (RTX 4000 Ada 20 GB) | ~$0.76/hr |
-| **Fixed total** | **~$6/mo** | **Compute total** | **~$0.80/hr** |
+| Models volume (50 GB) | $5/mo | Web droplet (small, 4 GB) | ~$0.036/hr |
+| Data volume (10 GB, incl. logs) | $1/mo | Ollama node — **cpu** (16 GB, blr1) | ~$0.167/hr |
+| **Fixed total** | **~$6/mo** | Ollama node — **gpu** (RTX 6000 Ada 48 GB, tor1) | ~$1.57/hr |
 
-**Monthly ≈ $6 + ($0.80 × hours running).** Idle floor ~$6/mo; ~20 hrs/mo ≈ $22;
-~50 hrs/mo ≈ $46. ⚠️ Left running 24/7 ≈ $590/mo — always `stop`. (Current
-on-demand AMS3 rates; per-second billing, 5-min minimum.)
+**cpu backend (default):** ≈ $6/mo + **~$0.20/hr** running (~$4.90/day 24×7).
+**gpu backend:** ≈ $6/mo + **~$1.61/hr** running — ~8× the CPU path; use it only to
+showcase real GPU inference. ⚠️ The GPU left 24/7 ≈ $1,160/mo — always `stop`.
+(Current on-demand rates; per-second billing, 5-min minimum.)
 
 ## Architecture gate checklist
 - [x] Every use case served by ≥1 capability

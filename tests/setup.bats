@@ -65,9 +65,10 @@ EOF
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	[ -f "$CONFIG_DIR/config" ]
-	grep -q "DO_REGION='ams3'" "$CONFIG_DIR/config"
+	# #17: region is backend-aware — the default (cpu) backend lives in blr1.
+	grep -q "DO_REGION='blr1'" "$CONFIG_DIR/config"
 	grep -q "DO_CPU_SIZE='s-2vcpu-4gb'" "$CONFIG_DIR/config"
-	grep -q "DO_GPU_SIZE='gpu-4000adax1-20gb'" "$CONFIG_DIR/config"
+	grep -q "DO_GPU_SIZE='gpu-6000adax1-48gb'" "$CONFIG_DIR/config"
 	grep -q "OLLAMA_MODEL='llama3.2:1b'" "$CONFIG_DIR/config"
 	# #18/#19: selectable backend (default cpu), CPU Ollama node size, optional firewall.
 	grep -q "OLLAMA_BACKEND='cpu'" "$CONFIG_DIR/config"
@@ -79,6 +80,18 @@ EOF
 	OLLAMA_BACKEND=gpu run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	grep -q "OLLAMA_BACKEND='gpu'" "$CONFIG_DIR/config"
+}
+
+@test "#17: the gpu backend derives the tor1 region (only affordable DO GPU)" {
+	OLLAMA_BACKEND=gpu run $DO setup --non-interactive
+	[ "$status" -eq 0 ]
+	grep -q "DO_REGION='tor1'" "$CONFIG_DIR/config"
+}
+
+@test "#17: an explicit DO_REGION still overrides the backend-derived default" {
+	OLLAMA_BACKEND=gpu DO_REGION=nyc2 run $DO setup --non-interactive
+	[ "$status" -eq 0 ]
+	grep -q "DO_REGION='nyc2'" "$CONFIG_DIR/config"
 }
 
 @test "setup captures the DO-registered key name from doctl" {
@@ -138,12 +151,14 @@ EOF
 }
 
 @test "a prior config value becomes the default on re-run" {
-	DO_REGION=sfo3 run $DO setup --non-interactive
+	# Region is now a pure function of backend (#17), so use a field that is
+	# seeded from stored config to exercise "prior value persists".
+	OLLAMA_MODEL=llama3.1:8b run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	# Second run without the override should preserve the stored value.
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
-	grep -q "DO_REGION='sfo3'" "$CONFIG_DIR/config"
+	grep -q "OLLAMA_MODEL='llama3.1:8b'" "$CONFIG_DIR/config"
 }
 
 @test "a value with a single quote round-trips (config stays sourceable)" {

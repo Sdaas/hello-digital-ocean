@@ -6,10 +6,12 @@
 # Idempotent: re-running skips work already done.
 #
 # What it does:
-#   1. ASSERT the NVIDIA driver is present and working (`nvidia-smi`). DO's
-#      AI/ML-ready image ships the driver, but it can be finalized by cloud-init
-#      at first boot, so this POLLS up to $NVIDIA_WAIT_SECS before giving up. It
-#      does NOT install drivers — that is the image's job (F5 scope boundary).
+#   1. INSTALL the NVIDIA driver, then ASSERT it works (`nvidia-smi`). We boot a
+#      plain Ubuntu image (there is no public RTX-6000-Ada base image), so the
+#      driver is installed here via `ubuntu-drivers` (#17, ADR-0002). The step is
+#      idempotent — it is skipped when nvidia-smi is already healthy — and can be
+#      disabled with $NVIDIA_INSTALL=0 (used by the GPU-less container test). The
+#      assertion then POLLS up to $NVIDIA_WAIT_SECS as the post-install gate.
 #   2. Attach the models Block Storage volume at $MODELS_MOUNT (/mnt/models):
 #      format-if-empty (never reformat — models persist across stop→start,
 #      ADR-0003), mount, and record it in /etc/fstab (DO by-id device path).
@@ -25,6 +27,7 @@
 #   MODELS_MOUNT       /mnt/models                          models volume mountpoint
 #   MODELS_VOLUME_NAME (unset)                              DO volume name → device
 #   MODELS_DEVICE      by-id path from MODELS_VOLUME_NAME   block device to mount
+#   NVIDIA_INSTALL     1                                    install driver (0 to skip)
 #   NVIDIA_WAIT_SECS   120                                  poll budget for nvidia-smi
 #   OLLAMA_HOST        0.0.0.0:11434                        Ollama bind (VPC-reachable)
 #   OLLAMA_INSTALL_URL https://ollama.com/install.sh        installer to curl | sh
@@ -37,6 +40,7 @@ set -euo pipefail
 MODELS_MOUNT="${MODELS_MOUNT:-/mnt/models}"
 MODELS_VOLUME_NAME="${MODELS_VOLUME_NAME:-}"
 MODELS_DEVICE="${MODELS_DEVICE:-${MODELS_VOLUME_NAME:+/dev/disk/by-id/scsi-0DO_Volume_$MODELS_VOLUME_NAME}}"
+NVIDIA_INSTALL="${NVIDIA_INSTALL:-1}"
 NVIDIA_WAIT_SECS="${NVIDIA_WAIT_SECS:-120}"
 OLLAMA_HOST="${OLLAMA_HOST:-0.0.0.0:11434}"
 OLLAMA_INSTALL_URL="${OLLAMA_INSTALL_URL:-https://ollama.com/install.sh}"
@@ -107,6 +111,30 @@ mount_volume() {
 	fi
 }
 
+# install_nvidia_driver — install the NVIDIA driver on a plain Ubuntu image.
+# Idempotent: no-op when nvidia-smi is already healthy. Skipped when
+# NVIDIA_INSTALL=0 (GPU-less container test / caller supplies its own driver).
+# Ollama bundles its own CUDA userspace, so only the kernel driver is installed.
+install_nvidia_driver() {
+	if [ "$NVIDIA_INSTALL" = 0 ]; then
+		log_info "NVIDIA_INSTALL=0 — skipping driver install (assert only)"
+		return 0
+	fi
+	if nvidia-smi >/dev/null 2>&1; then
+		log_info "NVIDIA driver already healthy — skipping install"
+		return 0
+	fi
+	log_info "installing the NVIDIA driver via ubuntu-drivers (plain Ubuntu image)"
+	export DEBIAN_FRONTEND=noninteractive
+	apt-get update
+	apt-get install -y ubuntu-drivers-common
+	# `ubuntu-drivers install` auto-selects the right driver for the card.
+	ubuntu-drivers install
+	# Load the module now so the assert below can pass without a reboot; harmless
+	# if it is already loaded. A reboot is only needed if this cannot bind.
+	modprobe nvidia 2>/dev/null || log_info "modprobe nvidia not yet loadable — the assert poll will confirm"
+}
+
 # assert_nvidia — poll nvidia-smi up to NVIDIA_WAIT_SECS; fail if never healthy.
 assert_nvidia() {
 	waited=0
@@ -116,7 +144,7 @@ assert_nvidia() {
 			return 0
 		fi
 		if [ "$waited" -ge "$NVIDIA_WAIT_SECS" ]; then
-			log_error "nvidia-smi not available/healthy after ${NVIDIA_WAIT_SECS}s — this must be a GPU droplet with the NVIDIA driver (DO AI/ML image); not installing drivers here"
+			log_error "nvidia-smi not available/healthy after ${NVIDIA_WAIT_SECS}s — driver install did not bind; this must be a GPU droplet and may need a reboot for the kernel module to load"
 			return 1
 		fi
 		log_debug "nvidia-smi not ready yet (waited ${waited}s) — driver may still be finalizing via cloud-init"
@@ -125,7 +153,8 @@ assert_nvidia() {
 	done
 }
 
-# --- 1. assert the GPU driver -----------------------------------------------
+# --- 1. install + assert the GPU driver -------------------------------------
+install_nvidia_driver
 assert_nvidia || exit 1
 
 # --- 2. models volume -------------------------------------------------------
