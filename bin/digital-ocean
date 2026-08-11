@@ -82,7 +82,13 @@ Commands:
   destroy          Full teardown: droplets + firewalls + volumes + VPC (all data
                    lost). Prompts to confirm; -y / --non-interactive skips it.
 
-Other cloud commands (ssh/logs/status) are added in later features.
+Debug helpers (need a running host — see 'start'):
+  ssh [cpu|gpu] [cmd...]   Open a root shell on the droplet (default cpu), or run
+                   'cmd' there one-shot (e.g. 'ssh gpu nvidia-smi').
+  logs [cpu|gpu] [-f]      Tail the service journal (cpu=app, gpu=ollama; default
+                   cpu). -f/--follow streams instead of the last 100 lines.
+  status [cpu|gpu]         Service state + health probe. No target → both nodes.
+
 With no command, prints a short banner.
 EOF
 }
@@ -1073,6 +1079,138 @@ _wait_app_health() { # cpu-ip
 	done
 }
 
+# --- `digital-ocean ssh|logs|status` (F9) -----------------------------------
+# Debug helpers. They reuse F7's non-interactive ssh surface (_ssh/_ssh_opts +
+# the pinned known_hosts → StrictHostKeyChecking=accept-new, never a yes/no
+# prompt) and the F6/F7 state file, so the CLI already knows the droplet IPs —
+# the user names a role (cpu|gpu), not a host.
+
+# Source the state file or fail with a pointer to `start`. Callers run this
+# before touching any DO_*_PUBLIC_IP.
+_load_state_or_die() {
+	if [ ! -f "$DO_STATE_FILE" ]; then
+		log_error "no infra state at $DO_STATE_FILE — run 'digital-ocean start' first."
+		return 1
+	fi
+	# shellcheck disable=SC1090
+	. "$DO_STATE_FILE"
+}
+
+# Resolve a role (cpu|gpu, default cpu) to "PUBLIC_IP UNIT HEALTH_URL".
+# cpu → the demo app (app.service, :5000/health);
+# gpu → the Ollama node (ollama.service, :11434/api/tags).
+# Unknown role → exit 2 (usage error); empty/missing IP → exit 1.
+_resolve_target() { # role
+	role="${1:-cpu}"
+	case "$role" in
+	cpu) ip="${DO_CPU_PUBLIC_IP:-}"; unit="app.service"; health="http://127.0.0.1:5000/health" ;;
+	gpu) ip="${DO_GPU_PUBLIC_IP:-}"; unit="ollama.service"; health="http://127.0.0.1:11434/api/tags" ;;
+	*)
+		log_error "unknown target '$role' (expected: cpu | gpu)"
+		usage >&2
+		return 2
+		;;
+	esac
+	if [ -z "$ip" ]; then
+		log_error "no public IP for the $role droplet in $DO_STATE_FILE — run 'digital-ocean start' first."
+		return 1
+	fi
+	printf '%s %s %s' "$ip" "$unit" "$health"
+}
+
+cmd_ssh() {
+	role="cpu"
+	# A leading cpu|gpu selects the droplet; anything after it is a remote command
+	# (e.g. `ssh gpu nvidia-smi`). An implicit-cpu remote command must name it
+	# explicitly (`ssh cpu <cmd>`) so a mistyped target can't be run as a command.
+	if [ $# -gt 0 ]; then
+		case "$1" in
+		cpu | gpu) role="$1"; shift ;;
+		*)
+			log_error "unknown target '$1' (expected: cpu | gpu)"
+			usage >&2
+			return 2
+			;;
+		esac
+	fi
+	_load_state_or_die || return 1
+	target="$(_resolve_target "$role")" || return $?
+	ip="${target%% *}"
+	if [ $# -gt 0 ]; then
+		# One-shot remote command (e.g. `ssh gpu nvidia-smi`).
+		_ssh "$ip" "$*"
+	else
+		# Interactive login shell (ssh allocates a tty when no command is given).
+		# Unquoted $(_ssh_opts) must word-split into flags — same as _ssh.
+		# shellcheck disable=SC2046,SC2086,SC2029
+		ssh $(_ssh_opts) "root@$ip"
+	fi
+}
+
+cmd_logs() {
+	role="cpu"; follow=0
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		cpu | gpu) role="$1"; shift ;;
+		-f | --follow) follow=1; shift ;;
+		*)
+			log_error "unknown argument to 'logs': $1"
+			usage >&2
+			return 2
+			;;
+		esac
+	done
+	_load_state_or_die || return 1
+	target="$(_resolve_target "$role")" || return $?
+	ip="${target%% *}"; rest="${target#* }"; unit="${rest%% *}"
+	if [ "$follow" -eq 1 ]; then
+		_ssh "$ip" "journalctl -u $unit -f"
+	else
+		_ssh "$ip" "journalctl -u $unit -n 100 --no-pager"
+	fi
+}
+
+# Print one node's service state + a local health probe. Best-effort: a down
+# unit or failing probe is reported, not fatal, so a two-node status still runs.
+_status_one() { # role
+	target="$(_resolve_target "$1")" || return $?
+	ip="${target%% *}"; rest="${target#* }"; unit="${rest%% *}"; health="${rest#* }"
+	printf '== %s (%s @ %s) ==\n' "$1" "$unit" "$ip"
+	active="$(_ssh "$ip" "systemctl is-active $unit" 2>/dev/null || true)"
+	printf 'service: %s\n' "${active:-unknown}"
+	if _ssh "$ip" "curl -fsS --max-time 5 $health >/dev/null" 2>/dev/null; then
+		printf 'health:  ok (%s)\n' "$health"
+	else
+		printf 'health:  FAIL (%s)\n' "$health"
+	fi
+}
+
+cmd_status() {
+	role=""
+	case "${1:-}" in
+	cpu | gpu) role="$1"; shift ;;
+	"") ;;
+	*)
+		log_error "unknown target '$1' (expected: cpu | gpu)"
+		usage >&2
+		return 2
+		;;
+	esac
+	if [ $# -gt 0 ]; then
+		log_error "unknown argument to 'status': $1"
+		usage >&2
+		return 2
+	fi
+	_load_state_or_die || return 1
+	if [ -n "$role" ]; then
+		_status_one "$role"
+	else
+		# No target → both nodes.
+		_status_one cpu || return $?
+		_status_one gpu || return $?
+	fi
+}
+
 # --- Dispatch ----------------------------------------------------------------
 
 main() {
@@ -1131,6 +1269,15 @@ main() {
 		;;
 	destroy)
 		cmd_destroy "$@"
+		;;
+	ssh)
+		cmd_ssh "$@"
+		;;
+	logs)
+		cmd_logs "$@"
+		;;
+	status)
+		cmd_status "$@"
 		;;
 	*)
 		log_error "unknown command: $subcommand"
