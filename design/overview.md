@@ -82,9 +82,9 @@ This file remains the home for design notes that emerge during per-feature
   runs both scripts in a real `ubuntu:22.04` Docker container (self-skips without
   `docker`); the volume-mount **positive path** and GPU-**present** path can only
   be exercised on a real droplet, so their un-mocked VERIFY is **deferred to F7**.
-- **DO resource provisioning (F6):** two **hidden** CLI subcommands —
-  `digital-ocean provision` and `deprovision` (not in `usage`; F7 `start` and F8
-  `stop`/`destroy` call the same helper functions later). `provision` **ensures**
+- **DO resource provisioning (F6):** a **hidden** CLI subcommand —
+  `digital-ocean provision` (not in `usage`; F7 `start` calls the same helper
+  functions, and F8 `stop`/`destroy` tear the resources back down). `provision` **ensures**
   (find-by-name → adopt, else create) a private VPC, the two volumes (data 10 GB
   → CPU, models 50 GB → GPU; ADR-0003), and the CPU + GPU droplets (SSH key by
   name, on the VPC; ADR-0007), **attaches** data→CPU / models→GPU, and records
@@ -97,8 +97,8 @@ This file remains the home for design notes that emerge during per-feature
   ext4`** so a filesystem always exists and the F5 provision scripts' format-if-
   empty is a guaranteed no-op (never reformats — persistence, ADR-0001/0003).
   Attach **skips** when already on the target droplet, **errors** when attached
-  elsewhere. **No auto-rollback** on partial failure (re-run adopts, or
-  `deprovision` cleans up). Droplet images are **config-driven** (`DO_CPU_IMAGE`
+  elsewhere. **No auto-rollback** on partial failure (re-run adopts, or `stop`/
+  `destroy` clean up). Droplet images are **config-driven** (`DO_CPU_IMAGE`
   default `ubuntu-22-04-x64`; `DO_GPU_IMAGE` = DO's AI/ML-ready image, resolved
   at VERIFY). A **source-guard** (`DO_SOURCE_ONLY=1`) lets the helper functions
   be loaded without running `main`, so the real-boundary test can drive them and
@@ -156,6 +156,26 @@ This file remains the home for design notes that emerge during per-feature
   region must become **backend-aware** (cpu→a 16 GB region like ams3; gpu→tor1) —
   a naive tor1 default would break the default CPU-8B backend. #18 leaves the
   region default (ams3) unchanged; #17 owns the retarget + this constraint.
+- **`digital-ocean stop` / `destroy` teardown (F8, #7):** the **public** teardown
+  surface, replacing the old hidden `deprovision`. `stop` destroys the droplets +
+  the two `start`-created firewalls but **keeps** volumes + VPC (compute billing
+  stops; data persists for a later `start`); `destroy` also removes volumes + VPC
+  and the `.do/state` file, behind a typed-`yes` confirmation (`-y` /
+  `--non-interactive` skips it — same flag as `setup`). Both share `_teardown`.
+  Two teardown bugs found at the #18/#19 live VERIFY are fixed here: **(1) async
+  delete race** — droplet delete is async, so we **poll `doctl droplet get` until
+  each droplet is gone** before deleting the volumes it was attached to
+  (`DO_DELETE_WAIT_SECS`/`_POLL_SLEEP`, overridable for tests); **(2) default VPC**
+  — a VPC auto-promoted to the region default returns `403 Can not delete default
+  VPCs`, so `_delete_vpc` **skips-with-warning** rather than erroring (a default
+  VPC is free and expected). **Snapshots: no-op** — the project creates none, so
+  there is nothing to delete (forward-looking). Teardown is best-effort per
+  resource; only a declined confirmation is a hard non-zero exit. The `doctl`
+  boundary is PATH-shimmed in the fast lane (`tests/do-provision.bats`, a stub
+  extended with async-linger droplet-get + a default-VPC 403 toggle); the
+  un-mocked teardown is covered by the real create→adopt→**destroy** in
+  `tests/integration/do-provision.bats`, with the full stop/destroy on real
+  droplets folded into the billable live VERIFY.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,

@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 #
-# Fast/hermetic tests for `digital-ocean provision` / `deprovision` (F6). The one
+# Fast/hermetic tests for `digital-ocean provision` (F6) and `stop` / `destroy`
+# (F8, the public teardown). The one
 # external boundary — the `doctl` CLI (VPC, volume, droplet, ssh-key, attach) —
 # is replaced by a STATEFUL PATH-shimmed stub that keeps a tiny on-disk registry,
 # so `create` then `list` reflect each other across separate CLI processes. That
@@ -89,6 +90,12 @@ case "$key" in
 "vpcs create")
 	id="$(_id "$name")"; [ -n "$(_find_id vpc "$name")" ] || _add vpc "$name" "$id" - -; printf '%s\n' "$id";;
 "vpcs delete")
+	# Bug 2 (F8): a VPC auto-promoted to the region default returns 403 on delete.
+	# DOCTL_VPC_DEFAULT=1 makes the stub emit that so teardown's tolerance is tested.
+	if [ "${DOCTL_VPC_DEFAULT:-0}" = "1" ]; then
+		echo "Error: DELETE https://api.digitalocean.com/v2/vpcs/${args[2]}: 403 Can not delete default VPCs" >&2
+		exit 1
+	fi
 	_del_by_id "${args[2]}";;
 "compute volume")
 	case "${args[2]:-}" in
@@ -107,6 +114,37 @@ case "$key" in
 	create) dn="${args[3]}"; id="$(_id "$dn")"; read -r pub priv <<<"$(_ips "$dn")"
 		[ -n "$(_find_id droplet "$dn")" ] || _add droplet "$dn" "$id" "$pub" "$priv"
 		printf '%s %s %s\n' "$id" "$pub" "$priv";;
+	delete)
+		# Bug 1 (F8): DO droplet delete is ASYNC. DOCTL_DROPLET_LINGER=N makes the
+		# droplet survive N subsequent `droplet get` polls before reporting gone, so
+		# the wait-until-gone loop is really exercised. Default 0 = gone immediately.
+		did="${args[3]}"
+		if [ "${DOCTL_DROPLET_LINGER:-0}" -gt 0 ]; then
+			printf '%s %s\n' "$did" "${DOCTL_DROPLET_LINGER}" >>"$REG/pending"
+		else
+			_del_by_id "$did"
+		fi;;
+	get)
+		# `droplet get <id>` — exit 0 (+print id) while it still exists, exit 1 once gone.
+		gid="${args[3]}"
+		if [ -f "$REG/pending" ] && grep -q "^$gid " "$REG/pending"; then
+			cnt="$(awk -v i="$gid" '$1==i{print $2; exit}' "$REG/pending")"
+			if [ "$cnt" -gt 1 ]; then
+				awk -v i="$gid" '{ if ($1==i) print $1, $2-1; else print }' "$REG/pending" >"$REG/pending.tmp"
+				mv "$REG/pending.tmp" "$REG/pending"
+				printf '%s\n' "$gid"; exit 0
+			fi
+			grep -v "^$gid " "$REG/pending" >"$REG/pending.tmp" 2>/dev/null; mv "$REG/pending.tmp" "$REG/pending"
+			_del_by_id "$gid"; exit 1
+		fi
+		if [ -n "$(awk -v i="$gid" '$1=="droplet" && $3==i{print; exit}' "$RES")" ]; then
+			printf '%s\n' "$gid"; exit 0
+		fi
+		exit 1;;
+	esac;;
+"compute firewall")
+	# F8 teardown deletes the two `start`-created firewalls. Best-effort delete-by-id.
+	case "${args[2]:-}" in
 	delete) _del_by_id "${args[3]}";;
 	esac;;
 "compute ssh-key")
@@ -218,12 +256,19 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	echo "$output" | grep -qi "attached"
 }
 
-# --- deprovision ------------------------------------------------------------
+# --- stop / destroy (F8) ----------------------------------------------------
+# `stop` = destroy droplets + firewalls, keep volumes + VPC. `destroy` = also
+# volumes + VPC (confirm). Both wait for droplets to be really gone (Bug 1) and
+# `destroy` tolerates a non-deletable default VPC (Bug 2). Poll waits are tiny.
 
-@test "deprovision destroys droplets, keeps volumes, prunes droplet state" {
+# Fast poll so the wait-until-gone loop doesn't slow the suite.
+_fast_teardown() { export DO_DELETE_POLL_SLEEP=1 DO_DELETE_WAIT_SECS=5; }
+
+@test "stop destroys droplets, keeps volumes + VPC, prunes droplet state" {
 	run $DO provision
 	[ "$status" -eq 0 ]
-	run $DO deprovision
+	_fast_teardown
+	run $DO stop
 	[ "$status" -eq 0 ]
 	# Droplets gone, volumes + VPC remain.
 	[ "$(_count droplet)" -eq 0 ]
@@ -234,31 +279,126 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	grep -q "DO_DATA_VOLUME_ID='id-hello-do-data'" "$CONFIG_DIR/state"
 }
 
-@test "deprovision --volumes destroys droplets, volumes and VPC" {
+@test "stop deletes the two firewalls when their IDs are in state" {
 	run $DO provision
 	[ "$status" -eq 0 ]
-	run $DO deprovision --volumes
+	# `start` records firewall IDs; simulate that so teardown has them to delete.
+	printf "DO_CPU_FW_ID='fw-cpu'\nDO_GPU_FW_ID='fw-gpu'\n" >>"$CONFIG_DIR/state"
+	_fast_teardown
+	: >"$REG/calls"
+	run $DO stop
+	[ "$status" -eq 0 ]
+	grep -q "compute firewall delete fw-cpu" "$REG/calls"
+	grep -q "compute firewall delete fw-gpu" "$REG/calls"
+}
+
+@test "stop waits for droplets to be gone before returning (Bug 1)" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	_fast_teardown
+	export DOCTL_DROPLET_LINGER=2   # each droplet survives 2 polls, then reports gone
+	: >"$REG/calls"
+	run $DO stop
+	[ "$status" -eq 0 ]
+	# The loop actually polled: at least one `droplet get` was issued.
+	grep -q "compute droplet get" "$REG/calls"
+	# And the droplets really are gone once stop returns.
+	[ "$(_count droplet)" -eq 0 ]
+}
+
+@test "destroy -y destroys droplets, volumes and VPC, removes state" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	_fast_teardown
+	run $DO destroy -y
 	[ "$status" -eq 0 ]
 	[ "$(_count droplet)" -eq 0 ]
 	[ "$(_count volume)" -eq 0 ]
 	[ "$(_count vpc)" -eq 0 ]
+	[ ! -f "$CONFIG_DIR/state" ]
 }
 
-@test "deprovision with no state is a no-op (exit 0)" {
-	run $DO deprovision
+@test "destroy deletes volumes only AFTER droplets report gone (Bug 1 ordering)" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	_fast_teardown
+	export DOCTL_DROPLET_LINGER=2
+	: >"$REG/calls"
+	run $DO destroy -y
+	[ "$status" -eq 0 ]
+	# In the calls log, a `droplet get` (the poll) must appear before the first
+	# `volume delete` — i.e. we waited for the droplet before touching volumes.
+	get_line="$(grep -n 'compute droplet get' "$REG/calls" | head -1 | cut -d: -f1)"
+	vol_line="$(grep -n 'compute volume delete' "$REG/calls" | head -1 | cut -d: -f1)"
+	[ -n "$get_line" ]
+	[ -n "$vol_line" ]
+	[ "$get_line" -lt "$vol_line" ]
+}
+
+@test "destroy tolerates a non-deletable default VPC (Bug 2)" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	_fast_teardown
+	export DOCTL_VPC_DEFAULT=1   # `vpcs delete` returns 403 "Can not delete default VPCs"
+	run $DO destroy -y
+	# Still succeeds; volumes + state gone, the free default VPC is left in place.
+	[ "$status" -eq 0 ]
+	[ "$(_count volume)" -eq 0 ]
+	[ "$(_count vpc)" -eq 1 ]
+	[ ! -f "$CONFIG_DIR/state" ]
+	echo "$output" | grep -qi "default vpc"
+}
+
+@test "destroy without -y proceeds when the user confirms with 'yes'" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	_fast_teardown
+	run bash -c "printf 'yes\n' | $DO destroy"
+	[ "$status" -eq 0 ]
+	[ "$(_count droplet)" -eq 0 ]
+	[ "$(_count volume)" -eq 0 ]
+	[ ! -f "$CONFIG_DIR/state" ]
+}
+
+@test "destroy without -y aborts and deletes nothing when not confirmed" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	_fast_teardown
+	run bash -c "printf '\n' | $DO destroy"
+	[ "$status" -ne 0 ]
+	# Nothing was touched.
+	[ "$(_count droplet)" -eq 2 ]
+	[ "$(_count volume)" -eq 2 ]
+	[ "$(_count vpc)" -eq 1 ]
+	[ -f "$CONFIG_DIR/state" ]
+}
+
+@test "stop with no state is a no-op (exit 0)" {
+	run $DO stop
+	[ "$status" -eq 0 ]
+}
+
+@test "destroy with no state is a no-op (exit 0)" {
+	run $DO destroy -y
 	[ "$status" -eq 0 ]
 }
 
 # --- misc -------------------------------------------------------------------
 
-@test "provision/deprovision are hidden from usage" {
+@test "stop and destroy are listed in usage; provision/deprovision are not" {
 	run $DO --help
 	[ "$status" -eq 0 ]
-	# Hidden low-level commands: F7 start / F8 destroy are the public surface.
-	# They must not appear as a listed command (an indented "Commands:" entry) —
-	# the description prose "provisions/tears down" is fine, so match a command row.
+	# Public teardown surface (F8) IS listed as a command row.
+	echo "$output" | grep -qE '^[[:space:]]+stop\b'
+	echo "$output" | grep -qE '^[[:space:]]+destroy\b'
+	# Hidden low-level `provision` and the retired `deprovision` are NOT command rows.
 	echo "$output" | grep -qE '^[[:space:]]+de?provision\b' && return 1
 	true
+}
+
+@test "deprovision has been removed (unknown command, exit 2)" {
+	run $DO deprovision
+	[ "$status" -eq 2 ]
 }
 
 @test "provision runs under zsh" {
