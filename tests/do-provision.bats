@@ -35,9 +35,9 @@ setup() {
 # key the doctl stub reports, so key resolution succeeds by default.
 _write_config() {
 	cat >"$CONFIG_DIR/config" <<EOF
-DO_REGION='ams3'
+DO_REGION='blr1'
 DO_CPU_SIZE='s-2vcpu-4gb'
-DO_GPU_SIZE='gpu-4000adax1-20gb'
+DO_GPU_SIZE='gpu-6000adax1-48gb'
 OLLAMA_MODEL='llama3.2:1b'
 DO_SSH_KEY_NAME='my-mac'
 APP_CREDENTIALS_FILE='$CONFIG_DIR/credentials'
@@ -167,13 +167,25 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	run $DO provision
 	[ "$status" -eq 0 ]
 	[ -f "$CONFIG_DIR/state" ]
-	grep -q "DO_VPC_ID='id-hello-do-vpc'" "$CONFIG_DIR/state"
+	# #17: VPC name is region-scoped (VPCs are region-bound; backend-aware regions
+	# must not collide on a shared name), so the blr1 config yields hello-do-vpc-blr1.
+	grep -q "DO_VPC_ID='id-hello-do-vpc-blr1'" "$CONFIG_DIR/state"
 	grep -q "DO_DATA_VOLUME_ID='id-hello-do-data'" "$CONFIG_DIR/state"
 	grep -q "DO_MODELS_VOLUME_ID='id-hello-do-models'" "$CONFIG_DIR/state"
 	grep -q "DO_CPU_DROPLET_ID='id-hello-do-cpu'" "$CONFIG_DIR/state"
 	grep -q "DO_GPU_DROPLET_ID='id-hello-do-gpu'" "$CONFIG_DIR/state"
 	grep -q "DO_CPU_PUBLIC_IP='203.0.113.10'" "$CONFIG_DIR/state"
 	grep -q "DO_GPU_PRIVATE_IP='10.10.0.20'" "$CONFIG_DIR/state"
+}
+
+@test "#17: the VPC name is region-scoped so regions never collide" {
+	# A different region must yield a different VPC (VPCs are region-bound). This is
+	# the cross-region adoption bug found at the #17 blr1 live VERIFY.
+	{ grep -v "^DO_REGION=" "$CONFIG_DIR/config"; echo "DO_REGION='tor1'"; } \
+		>"$CONFIG_DIR/config.new" && mv "$CONFIG_DIR/config.new" "$CONFIG_DIR/config"
+	run $DO provision
+	[ "$status" -eq 0 ]
+	grep -q "DO_VPC_ID='id-hello-do-vpc-tor1'" "$CONFIG_DIR/state"
 }
 
 @test "provision writes state file with private (0600) perms" {

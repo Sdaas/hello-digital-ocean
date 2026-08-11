@@ -41,9 +41,9 @@ setup() {
 # A valid .do/config as F4's `setup` would write it.
 _write_config() {
 	cat >"$CONFIG_DIR/config" <<EOF
-DO_REGION='ams3'
+DO_REGION='blr1'
 DO_CPU_SIZE='s-2vcpu-4gb'
-DO_GPU_SIZE='gpu-4000adax1-20gb'
+DO_GPU_SIZE='gpu-6000adax1-48gb'
 OLLAMA_MODEL='llama3.2:1b'
 DO_SSH_KEY_NAME='my-mac'
 APP_CREDENTIALS_FILE='$CONFIG_DIR/credentials'
@@ -331,14 +331,14 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$status" -eq 0 ]
 	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
 	echo "$node_create" | grep -q "s-8vcpu-16gb-amd"
-	echo "$node_create" | grep -qv "gpu-4000adax1-20gb"
+	echo "$node_create" | grep -qv "gpu-6000adax1-48gb"
 }
 
 @test "gpu backend: the Ollama droplet is created with the GPU size" {
 	OLLAMA_BACKEND=gpu run $DO start
 	[ "$status" -eq 0 ]
 	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
-	echo "$node_create" | grep -q "gpu-4000adax1-20gb"
+	echo "$node_create" | grep -q "gpu-6000adax1-48gb"
 }
 
 @test "start runs provision-cpu.sh with the data volume on the CPU droplet" {

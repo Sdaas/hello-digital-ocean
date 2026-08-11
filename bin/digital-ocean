@@ -237,6 +237,17 @@ _kv() { # key value
 	printf "%s='%s'\n" "$1" "$esc"
 }
 
+# Region is backend-aware (#17, ADR-0008): the only affordable DO GPU (RTX 6000
+# Ada) is tor1-only, while the CPU 16GB Ollama node has no tor1 size — so the GPU
+# backend runs in tor1 and the CPU backend in blr1 (India-local). An explicit
+# DO_REGION overrides this. Keep the two regions in one place.
+_region_for_backend() { # backend(cpu|gpu)
+	case "$1" in
+	gpu) printf 'tor1' ;;
+	*) printf 'blr1' ;;
+	esac
+}
+
 # Report a required local tool. Missing tools accumulate into _setup_fail.
 _check_tool() { # name install-hint
 	if command -v "$1" >/dev/null 2>&1; then
@@ -361,12 +372,16 @@ cmd_setup() {
 		. "$CONFIG_FILE"
 	fi
 
-	region="$(_field "$env_region" "${DO_REGION:-ams3}" "DigitalOcean region")"
-	cpu="$(_field "$env_cpu" "${DO_CPU_SIZE:-s-2vcpu-4gb}" "CPU droplet size")"
-	gpu="$(_field "$env_gpu" "${DO_GPU_SIZE:-gpu-4000adax1-20gb}" "GPU droplet size")"
 	# Ollama backend (#18): cpu (default — cheap, no GPU) or gpu. In cpu mode the
 	# Ollama node is a CPU droplet of DO_OLLAMA_CPU_SIZE instead of a GPU droplet.
+	# Resolved first because it drives the region default (#17).
 	backend="$(_field "$env_backend" "${OLLAMA_BACKEND:-cpu}" "Ollama backend (cpu|gpu)")"
+	# Region is a pure function of the backend (#17, ADR-0008): cpu→blr1, gpu→tor1.
+	# An explicit DO_REGION override still wins; the stored value is NOT used as the
+	# default, so switching backend always re-derives the correct region.
+	region="$(_field "$env_region" "$(_region_for_backend "$backend")" "DigitalOcean region")"
+	cpu="$(_field "$env_cpu" "${DO_CPU_SIZE:-s-2vcpu-4gb}" "CPU droplet size")"
+	gpu="$(_field "$env_gpu" "${DO_GPU_SIZE:-gpu-6000adax1-48gb}" "GPU droplet size")"
 	ollama_cpu="$(_field "$env_ollama_cpu" "${DO_OLLAMA_CPU_SIZE:-s-8vcpu-16gb-amd}" "CPU Ollama node size")"
 	# DO cloud firewall (#19): optional. Ollama is kept off the public net by the
 	# private-IP bind, so the firewall is defense-in-depth — default off (0).
@@ -532,10 +547,8 @@ _provision_load_config() {
 	# shellcheck disable=SC1090
 	. "$CONFIG_FILE"
 
-	DO_REGION="${DO_REGION:-ams3}"
-	DO_CPU_SIZE="${DO_CPU_SIZE:-s-2vcpu-4gb}"
-	DO_GPU_SIZE="${DO_GPU_SIZE:-gpu-4000adax1-20gb}"
-	# Ollama backend (#18) + optional firewall (#19).
+	# Ollama backend (#18) + optional firewall (#19). Resolved before the region,
+	# which is derived from it (#17).
 	OLLAMA_BACKEND="${OLLAMA_BACKEND:-cpu}"
 	DO_OLLAMA_CPU_SIZE="${DO_OLLAMA_CPU_SIZE:-s-8vcpu-16gb-amd}"
 	DO_ENABLE_FIREWALL="${DO_ENABLE_FIREWALL:-0}"
@@ -543,11 +556,21 @@ _provision_load_config() {
 		log_error "OLLAMA_BACKEND must be 'cpu' or 'gpu' (got '$OLLAMA_BACKEND')."
 		return 1
 	fi
+	# Region is backend-aware (#17, ADR-0008): cpu→blr1, gpu→tor1. setup writes a
+	# backend-consistent DO_REGION, so this derivation is the safety net for a
+	# hand-written config that omits the key (a stored value still wins).
+	DO_REGION="${DO_REGION:-$(_region_for_backend "$OLLAMA_BACKEND")}"
+	DO_CPU_SIZE="${DO_CPU_SIZE:-s-2vcpu-4gb}"
+	DO_GPU_SIZE="${DO_GPU_SIZE:-gpu-6000adax1-48gb}"
 	# Default so a config missing this key gives the clean "key not found" error
 	# below rather than a set -u "unbound variable" crash.
 	DO_SSH_KEY_NAME="${DO_SSH_KEY_NAME:-}"
 	# Resource names — fixed hello-do- prefix, overridable via env/config.
-	DO_VPC_NAME="${DO_VPC_NAME:-hello-do-vpc}"
+	# VPC name is region-scoped (#17): a DO VPC is bound to one region, and the
+	# backend-aware regions (blr1/tor1) must not collide on a shared name — a
+	# same-named VPC in another region would be adopted and then fail droplet
+	# create ("Failed to resolve VPC"). Deriving per region gives each its own.
+	DO_VPC_NAME="${DO_VPC_NAME:-hello-do-vpc-$DO_REGION}"
 	DO_DATA_VOLUME_NAME="${DO_DATA_VOLUME_NAME:-hello-do-data}"
 	DO_MODELS_VOLUME_NAME="${DO_MODELS_VOLUME_NAME:-hello-do-models}"
 	DO_CPU_NAME="${DO_CPU_NAME:-hello-do-cpu}"
@@ -555,12 +578,11 @@ _provision_load_config() {
 	# Volume sizes in GiB (ADR-0003 defaults).
 	DO_DATA_SIZE="${DO_DATA_SIZE:-10}"
 	DO_MODELS_SIZE="${DO_MODELS_SIZE:-50}"
-	# Droplet images. CPU: stock Ubuntu (matches provision-cpu.sh). GPU: DO's
-	# AI/ML-ready image that ships the NVIDIA driver provision-gpu.sh asserts —
-	# the default here is a PLACEHOLDER to be confirmed at VERIFY via
-	# `doctl compute image list --public`; override with DO_GPU_IMAGE.
+	# Droplet images. Both are plain stock Ubuntu: there is no public RTX-6000-Ada
+	# base image, so the GPU node boots plain Ubuntu and provision-gpu.sh installs
+	# the NVIDIA driver itself (#17, ADR-0002). Override via DO_CPU/GPU_IMAGE.
 	DO_CPU_IMAGE="${DO_CPU_IMAGE:-ubuntu-22-04-x64}"
-	DO_GPU_IMAGE="${DO_GPU_IMAGE:-gpu-ubuntu-22-04}"
+	DO_GPU_IMAGE="${DO_GPU_IMAGE:-ubuntu-22-04-x64}"
 
 	# The "Ollama node" is the DO_GPU_* droplet regardless of backend (the state
 	# keys stay DO_GPU_* — see design/overview.md). In cpu mode it's a plain CPU

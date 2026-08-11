@@ -31,8 +31,18 @@ setup() {
 	export SYSTEMCTL_LOG="$BATS_TEST_TMPDIR/systemctl.log"
 	export CHOWN_LOG="$BATS_TEST_TMPDIR/chown.log"
 	export MKFS_MARKER="$BATS_TEST_TMPDIR/mkfs.marker"
+	export APT_LOG="$BATS_TEST_TMPDIR/apt.log"
 
-	_shim_present nvidia-smi ""                 # default: GPU driver present
+	# Driver presence is modelled by a marker file: nvidia-smi succeeds iff the
+	# marker exists, and the `ubuntu-drivers` install creates it. Default: present,
+	# so the install step is a no-op (matching a droplet whose driver is up).
+	export DRIVER_MARKER="$BATS_TEST_TMPDIR/driver.installed"
+	: >"$DRIVER_MARKER"
+
+	_shim_nvidia                                 # nvidia-smi: 0 iff DRIVER_MARKER exists
+	_shim_present apt-get "echo \"apt-get \$*\" >>\"\$APT_LOG\""
+	_shim_present ubuntu-drivers "echo \"ubuntu-drivers \$*\" >>\"\$APT_LOG\"; touch \"\$DRIVER_MARKER\""
+	_shim_present modprobe "echo \"modprobe \$*\" >>\"\$APT_LOG\""
 	_shim_present curl "touch \"\$CURL_MARKER\""  # records the install fetch
 	_shim_present sh ""                          # consumes the piped installer
 	_shim_present systemctl "echo \"systemctl \$*\" >>\"\$SYSTEMCTL_LOG\""
@@ -48,6 +58,16 @@ setup() {
 _shim_present() {
 	{ printf '#!/usr/bin/env bash\n'; printf '%s\n' "$2"; printf 'exit 0\n'; } >"$SHIM/$1"
 	chmod +x "$SHIM/$1"
+}
+
+# nvidia-smi that mirrors driver state: succeeds only once DRIVER_MARKER exists.
+_shim_nvidia() {
+	cat >"$SHIM/nvidia-smi" <<'EOF'
+#!/usr/bin/env bash
+[ -f "$DRIVER_MARKER" ] && exit 0
+exit 1
+EOF
+	chmod +x "$SHIM/nvidia-smi"
 }
 
 _shim_blkid() {
@@ -73,8 +93,32 @@ EOF
 	[ "$status" -eq 0 ]
 }
 
-@test "gpu: fails fast when nvidia-smi is missing or the driver is not ready" {
-	_shim_present nvidia-smi "exit 1"   # driver never comes up
+@test "gpu: installs the NVIDIA driver before asserting when it is absent" {
+	rm -f "$DRIVER_MARKER"            # plain Ubuntu image: no driver yet
+	run bash "$GPU"
+	[ "$status" -eq 0 ]              # install brought the driver up, assert passed
+	grep -q "^apt-get " "$APT_LOG"   # ran apt
+	grep -q "^ubuntu-drivers " "$APT_LOG"
+}
+
+@test "gpu: skips the driver install when nvidia-smi is already healthy" {
+	run bash "$GPU"                  # DRIVER_MARKER present by default
+	[ "$status" -eq 0 ]
+	[ ! -s "$APT_LOG" ]             # idempotent: no apt / ubuntu-drivers work
+}
+
+@test "gpu: NVIDIA_INSTALL=0 skips the install and asserts only (integration guard)" {
+	rm -f "$DRIVER_MARKER"
+	NVIDIA_INSTALL=0 run bash "$GPU"
+	[ "$status" -ne 0 ]             # no install, no GPU → fail fast
+	[ ! -s "$APT_LOG" ]            # never touched apt
+	echo "$output" | grep -qi "nvidia"
+}
+
+@test "gpu: fails when the driver never comes up even after an install attempt" {
+	rm -f "$DRIVER_MARKER"
+	# A broken install that does not bring nvidia-smi up: driver stays absent.
+	_shim_present ubuntu-drivers "echo \"ubuntu-drivers \$*\" >>\"\$APT_LOG\""
 	run bash "$GPU"
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -qi "nvidia"

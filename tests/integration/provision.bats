@@ -75,7 +75,11 @@ setup() {
 }
 
 @test "integration: provision-gpu.sh asserts the NVIDIA driver and fails fast when absent" {
+	# NVIDIA_INSTALL=0 skips the apt driver install (#17) — a GPU-less container
+	# can't get a real driver anyway — so this still exercises the assert NEGATIVE
+	# path un-mocked and fails fast, keeping the container test fast and offline.
 	run docker run --rm -v "$REPO:/repo:ro" \
+		-e NVIDIA_INSTALL=0 \
 		-e NVIDIA_WAIT_SECS=0 \
 		-e MODELS_MOUNT=/tmp/models \
 		-e FSTAB_FILE=/tmp/fstab \
