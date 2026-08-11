@@ -29,6 +29,7 @@ setup() {
 	# Keep the health/SSH waits fast in the hermetic lane.
 	export DO_SSH_WAIT_SECS=3
 	export DO_HEALTH_WAIT_SECS=3
+	export DO_RETRY_SLEEP=0
 
 	_write_config
 	_write_creds
@@ -64,6 +65,10 @@ _shim_doctl() {
 REG="${DOCTL_REG:?}"; RES="$REG/resources"; ATT="$REG/attach"; CALLS="$REG/calls"; FW="$REG/fw"
 : >>"$RES"; : >>"$ATT"; : >>"$CALLS"; : >>"$FW"
 printf '%s\n' "$*" >>"$CALLS"
+
+# Real doctl's `vpcs create` does NOT support --format (unlike volume/droplet
+# create) — mimic that failure so ensure_vpc can't regress to passing it (#18 VERIFY).
+case "$*" in "vpcs create"*--format*) echo "Error: unknown flag: --format" >&2; exit 1;; esac
 
 name=""; dropids=""; args=()
 while [ $# -gt 0 ]; do
@@ -124,7 +129,10 @@ case "$key" in
 "compute firewall")
 	case "${args[2]:-}" in
 	list) awk '$1=="fw"{print $2, $3}' "$RES";;
-	create) fn="$name"; id="$(_id "$fn")"; [ -n "$(_find_id fw "$fn")" ] || _add fw "$fn" "$id" - -
+	create)
+		# Simulate a token without firewall scope: create is denied (no ID, non-zero).
+		if [ -n "${DOCTL_FW_DENY:-}" ]; then echo "Error: forbidden (firewall scope)" >&2; exit 1; fi
+		fn="$name"; id="$(_id "$fn")"; [ -n "$(_find_id fw "$fn")" ] || _add fw "$fn" "$id" - -
 		printf 'create %s %s\n' "$fn" "$id" >>"$FW"; printf '%s\n' "$id";;
 	"add-droplets") printf 'add-droplets %s\n' "$dropids" >>"$FW";;
 	get) fn="${args[3]}"; _find_id fw "$fn";;
@@ -184,6 +192,16 @@ EOF
 	cat >"$SHIM/rsync" <<'EOF'
 #!/usr/bin/env bash
 LOG="${DO_SHIM_LOG:?}"
+# Simulate a transient reset/stall for the first N calls if the gate file exists,
+# so the CLI's _retry wrapper can be exercised.
+if [ -f "$LOG/rsync_fail" ]; then
+	n="$(cat "$LOG/rsync_fail" 2>/dev/null || echo 0)"
+	if [ "$n" -gt 0 ]; then
+		printf '%s\n' "$((n - 1))" >"$LOG/rsync_fail"
+		echo "rsync: connection unexpectedly closed" >&2
+		exit 12
+	fi
+fi
 args=()
 while [ $# -gt 0 ]; do case "$1" in -e) shift 2;; -*) shift;; *) args+=("$1"); shift;; esac; done
 printf '%s\n' "${args[*]}" >>"$LOG/rsync"
@@ -220,8 +238,23 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	grep -q "id-hello-do-models id-hello-do-gpu" "$REG/attach"
 }
 
-@test "start ensures two firewalls: cpu (5000+22 public) and gpu (11434 from VPC)" {
+# --- firewall: optional (#19) -----------------------------------------------
+
+@test "start skips DO firewalls by default (private-IP bind is the control) and still succeeds" {
+	# _write_config sets no DO_ENABLE_FIREWALL, so the default (0/off) applies.
 	run $DO start
+	[ "$status" -eq 0 ]
+	# No firewall was created or assigned…
+	[ ! -s "$REG/fw" ] || run grep -q "create hello-do" "$REG/fw"
+	run grep -E "firewall create" "$REG/calls"
+	[ "$status" -ne 0 ]
+	# …and the firewall IDs in state are empty.
+	grep -q "DO_CPU_FW_ID=''" "$CONFIG_DIR/state"
+	grep -q "DO_GPU_FW_ID=''" "$CONFIG_DIR/state"
+}
+
+@test "start ensures two firewalls when DO_ENABLE_FIREWALL=1: cpu (5000+22 public) and gpu (11434 from VPC)" {
+	DO_ENABLE_FIREWALL=1 run $DO start
 	[ "$status" -eq 0 ]
 	# Both firewalls created and recorded in state.
 	grep -q "create hello-do-cpu-fw" "$REG/fw"
@@ -240,6 +273,14 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	grep -q "add-droplets id-hello-do-gpu" "$REG/fw"
 }
 
+@test "start hard-fails when a firewall is requested (=1) but the token lacks scope" {
+	export DOCTL_FW_DENY=1
+	DO_ENABLE_FIREWALL=1 run $DO start
+	[ "$status" -ne 0 ]
+	# Points the operator at the scope issue (#16) rather than silently continuing.
+	echo "$output" | grep -qi "firewall"
+}
+
 @test "start rsyncs demo+infra to /opt/app on BOTH droplets" {
 	run $DO start
 	[ "$status" -eq 0 ]
@@ -251,15 +292,53 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	grep -q "infra" "$LOG/rsync"
 }
 
-@test "start runs provision-gpu.sh then pulls the model on the GPU droplet" {
+# --- Ollama node: backend selection (#18) + private-IP bind (#19) -----------
+
+@test "default (cpu) backend: provisions the CPU Ollama node and pulls the model" {
 	run $DO start
 	[ "$status" -eq 0 ]
-	# provision-gpu.sh runs on the GPU host with the models volume name.
-	gpu="$(_ssh_to 203.0.113.20)"
-	echo "$gpu" | grep -q "provision-gpu.sh"
-	echo "$gpu" | grep -q "MODELS_VOLUME_NAME=hello-do-models"
-	# C8: ollama pull of the configured model, on the GPU.
-	echo "$gpu" | grep -q "ollama pull llama3.2:1b"
+	# The Ollama node (the DO_GPU_* droplet) runs the CPU provisioning script — NOT the GPU one.
+	node="$(_ssh_to 203.0.113.20)"
+	echo "$node" | grep -q "provision-ollama-cpu.sh"
+	echo "$node" | grep -qv "provision-gpu.sh"
+	echo "$node" | grep -q "MODELS_VOLUME_NAME=hello-do-models"
+	# C8: ollama pull of the configured model, on the Ollama node.
+	echo "$node" | grep -q "ollama pull llama3.2:1b"
+}
+
+@test "cpu backend: Ollama is bound to the node's PRIVATE VPC IP, not 0.0.0.0 (#19)" {
+	run $DO start
+	[ "$status" -eq 0 ]
+	node="$(_ssh_to 203.0.113.20)"
+	# The provisioning step binds Ollama to the private IP…
+	echo "$node" | grep -q "OLLAMA_HOST=10.10.0.20:11434"
+	echo "$node" | grep -qv "OLLAMA_HOST=0.0.0.0"
+	# …and `ollama pull` targets the same private host (the CLI defaults to loopback).
+	echo "$node" | grep -q "OLLAMA_HOST=10.10.0.20:11434 ollama pull"
+}
+
+@test "gpu backend: provisions the GPU Ollama node with provision-gpu.sh" {
+	OLLAMA_BACKEND=gpu run $DO start
+	[ "$status" -eq 0 ]
+	node="$(_ssh_to 203.0.113.20)"
+	echo "$node" | grep -q "provision-gpu.sh"
+	echo "$node" | grep -qv "provision-ollama-cpu.sh"
+	echo "$node" | grep -q "OLLAMA_HOST=10.10.0.20:11434"
+}
+
+@test "cpu backend: the Ollama droplet is created with the CPU size (DO_OLLAMA_CPU_SIZE default)" {
+	run $DO start
+	[ "$status" -eq 0 ]
+	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
+	echo "$node_create" | grep -q "s-8vcpu-16gb-amd"
+	echo "$node_create" | grep -qv "gpu-4000adax1-20gb"
+}
+
+@test "gpu backend: the Ollama droplet is created with the GPU size" {
+	OLLAMA_BACKEND=gpu run $DO start
+	[ "$status" -eq 0 ]
+	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
+	echo "$node_create" | grep -q "gpu-4000adax1-20gb"
 }
 
 @test "start runs provision-cpu.sh with the data volume on the CPU droplet" {
@@ -309,7 +388,8 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$status" -eq 0 ]
 	[ "$(_count droplet)" -eq 2 ]
 	[ "$(_count volume)" -eq 2 ]
-	[ "$(_count fw)" -eq 2 ]
+	# Firewalls are off by default (#19), so none exist to duplicate either.
+	[ "$(_count fw)" -eq 0 ]
 	run grep -E "(vpcs create|volume create|droplet create|firewall create)" "$REG/calls"
 	[ "$status" -ne 0 ]
 }
@@ -322,6 +402,23 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -q "setup"
 	run grep -E "create" "$REG/calls"
+	[ "$status" -ne 0 ]
+}
+
+@test "start retries a transient rsync reset/stall and still succeeds" {
+	# Fresh droplets can reset/stall the first transfer under cloud-init; the CLI
+	# must retry rather than fail the whole start (found at #18 live VERIFY).
+	printf '2\n' >"$LOG/rsync_fail"   # first two rsync attempts fail, then succeed
+	run $DO start
+	[ "$status" -eq 0 ]
+	# The sync still landed on both droplets after the retries.
+	grep -q "203.0.113.10:/opt/app" "$LOG/rsync"
+	grep -q "203.0.113.20:/opt/app" "$LOG/rsync"
+}
+
+@test "start gives up if rsync never succeeds (bounded retries, non-zero)" {
+	printf '99\n' >"$LOG/rsync_fail"   # fail far more than the retry budget
+	run $DO start
 	[ "$status" -ne 0 ]
 }
 

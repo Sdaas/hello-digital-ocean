@@ -54,6 +54,10 @@ REG="${DOCTL_REG:?}"; RES="$REG/resources"; ATT="$REG/attach"; CALLS="$REG/calls
 : >>"$RES"; : >>"$ATT"; : >>"$CALLS"
 printf '%s\n' "$*" >>"$CALLS"
 
+# Real doctl's `vpcs create` does NOT support --format (unlike volume/droplet
+# create) — mimic that failure so ensure_vpc can't regress to passing it (#18 VERIFY).
+case "$*" in "vpcs create"*--format*) echo "Error: unknown flag: --format" >&2; exit 1;; esac
+
 # Split flags from positionals; capture the flag values we care about.
 name=""; args=()
 while [ $# -gt 0 ]; do
@@ -107,7 +111,9 @@ case "$key" in
 	esac;;
 "compute ssh-key")
 	# ssh-key list --format Name,ID : report a single key named my-mac.
-	printf '%s %s\n' "${DOCTL_KEY_NAME:-my-mac}" "111";;
+	# Real doctl PADS the Name column with trailing spaces to align it — emulate
+	# that (regression for _resolve_ssh_key stripping the pad; found at #18 VERIFY).
+	printf '%-28s %s\n' "${DOCTL_KEY_NAME:-my-mac}" "111";;
 "account get") exit 0;;
 esac
 exit 0

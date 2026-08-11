@@ -301,6 +301,9 @@ cmd_setup() {
 	env_region="${DO_REGION:-}"
 	env_cpu="${DO_CPU_SIZE:-}"
 	env_gpu="${DO_GPU_SIZE:-}"
+	env_backend="${OLLAMA_BACKEND:-}"
+	env_ollama_cpu="${DO_OLLAMA_CPU_SIZE:-}"
+	env_enable_fw="${DO_ENABLE_FIREWALL:-}"
 	env_model="${OLLAMA_MODEL:-}"
 	env_keyname="${DO_SSH_KEY_NAME:-}"
 	env_creds="${APP_CREDENTIALS_FILE:-}"
@@ -357,6 +360,13 @@ cmd_setup() {
 	region="$(_field "$env_region" "${DO_REGION:-ams3}" "DigitalOcean region")"
 	cpu="$(_field "$env_cpu" "${DO_CPU_SIZE:-s-2vcpu-4gb}" "CPU droplet size")"
 	gpu="$(_field "$env_gpu" "${DO_GPU_SIZE:-gpu-4000adax1-20gb}" "GPU droplet size")"
+	# Ollama backend (#18): cpu (default — cheap, no GPU) or gpu. In cpu mode the
+	# Ollama node is a CPU droplet of DO_OLLAMA_CPU_SIZE instead of a GPU droplet.
+	backend="$(_field "$env_backend" "${OLLAMA_BACKEND:-cpu}" "Ollama backend (cpu|gpu)")"
+	ollama_cpu="$(_field "$env_ollama_cpu" "${DO_OLLAMA_CPU_SIZE:-s-8vcpu-16gb-amd}" "CPU Ollama node size")"
+	# DO cloud firewall (#19): optional. Ollama is kept off the public net by the
+	# private-IP bind, so the firewall is defense-in-depth — default off (0).
+	enable_fw="$(_field "$env_enable_fw" "${DO_ENABLE_FIREWALL:-0}" "Enable DO firewall (0|1)")"
 	model="$(_field "$env_model" "${OLLAMA_MODEL:-llama3.2:1b}" "Ollama model")"
 	key_name="$(_field "$env_keyname" "${DO_SSH_KEY_NAME:-$do_key_name}" "DO SSH key name")"
 	creds="$(_field "$env_creds" "${APP_CREDENTIALS_FILE:-$CONFIG_DIR/credentials}" "Local credentials file")"
@@ -376,6 +386,9 @@ cmd_setup() {
 		_kv DO_REGION "$region"
 		_kv DO_CPU_SIZE "$cpu"
 		_kv DO_GPU_SIZE "$gpu"
+		_kv OLLAMA_BACKEND "$backend"
+		_kv DO_OLLAMA_CPU_SIZE "$ollama_cpu"
+		_kv DO_ENABLE_FIREWALL "$enable_fw"
 		_kv OLLAMA_MODEL "$model"
 		_kv DO_SSH_KEY_NAME "$key_name"
 		_kv APP_CREDENTIALS_FILE "$creds"
@@ -399,10 +412,14 @@ cmd_setup() {
 # Resolve a DO SSH key NAME to its ID (last field of the matching list row).
 # Echoes the ID, or nothing when the name is not registered on the account.
 _resolve_ssh_key() { # name
+	# doctl right-pads the Name column with spaces to align it, so split on the
+	# LAST field for the ID and strip the trailing pad off the name before
+	# comparing (a bare `${line% *}` leaves the pad and never matches).
 	doctl compute ssh-key list --format Name,ID --no-header 2>/dev/null |
 		while IFS= read -r line; do
-			id="${line##* }"  # last whitespace-delimited field
-			kn="${line% *}"   # everything before it (name may contain spaces)
+			id="${line##* }"                        # last whitespace-delimited field (ID)
+			kn="${line% *}"                         # everything before it (name may contain spaces)
+			kn="${kn%"${kn##*[![:space:]]}"}"       # strip trailing whitespace (the column pad)
 			if [ "$kn" = "$1" ]; then
 				printf '%s' "$id"
 				break
@@ -417,7 +434,10 @@ ensure_vpc() { # name
 		log_info "vpc $1: adopting existing ($id)"
 	else
 		log_info "vpc $1: creating in $DO_REGION"
-		id="$(doctl vpcs create --name "$1" --region "$DO_REGION" --format ID --no-header)"
+		# `doctl vpcs create` does NOT accept --format (unlike volume/droplet
+		# create), so create without it, then re-list by name to get the ID.
+		doctl vpcs create --name "$1" --region "$DO_REGION" >/dev/null || return 1
+		id="$(doctl vpcs list --format Name,ID --no-header 2>/dev/null | awk -v n="$1" '$1==n{print $2; exit}')"
 	fi
 	printf '%s' "$id"
 }
@@ -511,6 +531,14 @@ _provision_load_config() {
 	DO_REGION="${DO_REGION:-ams3}"
 	DO_CPU_SIZE="${DO_CPU_SIZE:-s-2vcpu-4gb}"
 	DO_GPU_SIZE="${DO_GPU_SIZE:-gpu-4000adax1-20gb}"
+	# Ollama backend (#18) + optional firewall (#19).
+	OLLAMA_BACKEND="${OLLAMA_BACKEND:-cpu}"
+	DO_OLLAMA_CPU_SIZE="${DO_OLLAMA_CPU_SIZE:-s-8vcpu-16gb-amd}"
+	DO_ENABLE_FIREWALL="${DO_ENABLE_FIREWALL:-0}"
+	if [ "$OLLAMA_BACKEND" != cpu ] && [ "$OLLAMA_BACKEND" != gpu ]; then
+		log_error "OLLAMA_BACKEND must be 'cpu' or 'gpu' (got '$OLLAMA_BACKEND')."
+		return 1
+	fi
 	# Default so a config missing this key gives the clean "key not found" error
 	# below rather than a set -u "unbound variable" crash.
 	DO_SSH_KEY_NAME="${DO_SSH_KEY_NAME:-}"
@@ -529,6 +557,17 @@ _provision_load_config() {
 	# `doctl compute image list --public`; override with DO_GPU_IMAGE.
 	DO_CPU_IMAGE="${DO_CPU_IMAGE:-ubuntu-22-04-x64}"
 	DO_GPU_IMAGE="${DO_GPU_IMAGE:-gpu-ubuntu-22-04}"
+
+	# The "Ollama node" is the DO_GPU_* droplet regardless of backend (the state
+	# keys stay DO_GPU_* — see design/overview.md). In cpu mode it's a plain CPU
+	# droplet (DO_OLLAMA_CPU_SIZE, stock Ubuntu image); in gpu mode a GPU droplet.
+	if [ "$OLLAMA_BACKEND" = gpu ]; then
+		DO_OLLAMA_NODE_SIZE="$DO_GPU_SIZE"
+		DO_OLLAMA_NODE_IMAGE="$DO_GPU_IMAGE"
+	else
+		DO_OLLAMA_NODE_SIZE="$DO_OLLAMA_CPU_SIZE"
+		DO_OLLAMA_NODE_IMAGE="$DO_CPU_IMAGE"
+	fi
 }
 
 cmd_provision() {
@@ -561,7 +600,7 @@ cmd_provision() {
 	DO_CPU_DROPLET_ID="$(printf '%s' "$cpu_line" | awk '{print $1}')"
 	DO_CPU_PUBLIC_IP="$(printf '%s' "$cpu_line" | awk '{print $2}')"
 	DO_CPU_PRIVATE_IP="$(printf '%s' "$cpu_line" | awk '{print $3}')"
-	gpu_line="$(ensure_droplet "$DO_GPU_NAME" "$DO_GPU_SIZE" "$DO_GPU_IMAGE")"
+	gpu_line="$(ensure_droplet "$DO_GPU_NAME" "$DO_OLLAMA_NODE_SIZE" "$DO_OLLAMA_NODE_IMAGE")"
 	DO_GPU_DROPLET_ID="$(printf '%s' "$gpu_line" | awk '{print $1}')"
 	DO_GPU_PUBLIC_IP="$(printf '%s' "$gpu_line" | awk '{print $2}')"
 	DO_GPU_PRIVATE_IP="$(printf '%s' "$gpu_line" | awk '{print $3}')"
@@ -649,12 +688,33 @@ DO_SSH_WAIT_SECS="${DO_SSH_WAIT_SECS:-180}"
 DO_HEALTH_WAIT_SECS="${DO_HEALTH_WAIT_SECS:-120}"
 
 # Standard SSH options: batch (never prompt), accept-new host keys into our pinned
-# known_hosts, and a bounded connect timeout. A resolved local key is added if we
-# find one; otherwise we fall back to the agent/default identities.
+# known_hosts, a bounded connect timeout, and keepalives so a STALLED connection
+# is torn down (ServerAliveInterval*CountMax ≈ 60s) instead of hanging forever — a
+# fresh droplet's sshd can stall mid-transfer during cloud-init. A resolved local
+# key is added if we find one; otherwise we fall back to the agent/default identities.
 _ssh_opts() {
-	printf '%s' "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10"
+	printf '%s' "-o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=$KNOWN_HOSTS -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
 	keyfile="$(_local_ssh_key || true)"
 	[ -n "$keyfile" ] && printf ' %s' "-i $keyfile"
+}
+
+# _retry N CMD... — run CMD up to N times with a short backoff, returning success
+# on the first pass. Used to ride out fresh-droplet transients (sshd restarting
+# under cloud-init) that make an early rsync reset or stall; every retried step is
+# idempotent, so a re-attempt is always safe.
+_retry() { # count cmd...
+	tries="$1"; shift
+	i=1
+	while true; do
+		if "$@"; then return 0; fi
+		if [ "$i" -ge "$tries" ]; then
+			log_error "still failing after $tries attempts: $*"
+			return 1
+		fi
+		log_info "attempt $i/$tries failed; retrying in ${DO_RETRY_SLEEP:-5}s: $1"
+		sleep "${DO_RETRY_SLEEP:-5}"
+		i=$((i + 1))
+	done
 }
 
 # _ssh HOST REMOTE-COMMAND — run one (single-line) command as root on HOST.
@@ -675,8 +735,15 @@ _scp() { # local remote
 # _rsync LOCAL... HOST:DIR — sync local trees to a droplet over ssh. Excludes the
 # Mac-local runtime cruft (venv, pycache, LOCAL run data) so only source ships.
 _rsync() { # local... remote
+	# NO --delete-excluded: a Homebrew rsync (3.2.7) sending it to Ubuntu's rsync
+	# (3.2.3) overflows the receiver's rule buffer (exclude.c recv_rules) and kills
+	# the remote — a cross-version filter-rule incompatibility. It isn't needed here
+	# (droplets are ephemeral so /opt/app starts empty, and the --exclude list
+	# already keeps cruft out of the transfer). --timeout=120 aborts a stalled
+	# transfer instead of hanging; callers wrap this in _retry to ride out a
+	# fresh-boot reset.
 	# shellcheck disable=SC2086
-	rsync -az --delete-excluded \
+	rsync -az --timeout=120 \
 		--exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' \
 		--exclude='.localdata' --exclude='.pytest_cache' \
 		-e "ssh $(_ssh_opts)" "$@"
@@ -714,7 +781,12 @@ ensure_firewall() { # name inbound-rules
 		log_info "firewall $1: creating"
 		id="$(doctl compute firewall create --name "$1" \
 			--inbound-rules "$2" --outbound-rules "$FW_OUTBOUND_ALL" \
-			--format ID --no-header)"
+			--format ID --no-header 2>/dev/null)"
+		if [ -z "$id" ]; then
+			log_error "firewall $1: create failed — the doctl token likely lacks firewall scope (#16)."
+			log_error "Set DO_ENABLE_FIREWALL=0 to run without it: Ollama is already off the public net via its private-IP bind (#19)."
+			return 1
+		fi
 	fi
 	printf '%s' "$id"
 }
@@ -745,21 +817,29 @@ cmd_start() {
 	# shellcheck disable=SC1090
 	. "$DO_STATE_FILE"
 
-	log_info "Securing with DO cloud firewalls (ADR-0007: only CPU:5000 public)."
-	# 2. Firewalls. CPU: app + ssh public. GPU: Ollama only from inside the VPC.
-	# The GPU rule MUST be scoped to the VPC range — if we can't resolve it, fail
-	# rather than fall back to a rule that would expose unauthenticated Ollama.
-	vpc_range="$(doctl vpcs get "$DO_VPC_ID" --format IPRange --no-header 2>/dev/null)"
-	if [ -z "$vpc_range" ]; then
-		log_error "could not resolve the VPC IP range for $DO_VPC_ID — refusing to open Ollama without it."
-		return 1
+	# 2. Firewalls (OPTIONAL — #19). Ollama is kept off the public net by its
+	# private-IP bind (step 5), so a DO firewall is defense-in-depth, default off.
+	# Enabling it needs a firewall-scoped token (#16); skipping it lets `start` run
+	# on the current token.
+	if [ "$DO_ENABLE_FIREWALL" = 1 ]; then
+		log_info "Securing with DO cloud firewalls (DO_ENABLE_FIREWALL=1)."
+		# CPU: app + ssh public. GPU/Ollama node: :11434 only from inside the VPC.
+		# The Ollama rule MUST be scoped to the VPC range — if we can't resolve it,
+		# fail rather than fall back to a rule that would expose Ollama.
+		vpc_range="$(doctl vpcs get "$DO_VPC_ID" --format IPRange --no-header 2>/dev/null)"
+		if [ -z "$vpc_range" ]; then
+			log_error "could not resolve the VPC IP range for $DO_VPC_ID — refusing to open Ollama without it."
+			return 1
+		fi
+		DO_CPU_FW_ID="$(ensure_firewall "${DO_CPU_NAME}-fw" \
+			"protocol:tcp,ports:5000,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
+		DO_GPU_FW_ID="$(ensure_firewall "${DO_GPU_NAME}-fw" \
+			"protocol:tcp,ports:11434,address:$vpc_range protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
+		assign_firewall "$DO_CPU_FW_ID" "$DO_CPU_DROPLET_ID" || return 1
+		assign_firewall "$DO_GPU_FW_ID" "$DO_GPU_DROPLET_ID" || return 1
+	else
+		log_info "Skipping DO firewalls (DO_ENABLE_FIREWALL=0); Ollama stays private via its VPC-IP bind (#19)."
 	fi
-	DO_CPU_FW_ID="$(ensure_firewall "${DO_CPU_NAME}-fw" \
-		"protocol:tcp,ports:5000,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")"
-	DO_GPU_FW_ID="$(ensure_firewall "${DO_GPU_NAME}-fw" \
-		"protocol:tcp,ports:11434,address:$vpc_range protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")"
-	assign_firewall "$DO_CPU_FW_ID" "$DO_CPU_DROPLET_ID" || return 1
-	assign_firewall "$DO_GPU_FW_ID" "$DO_GPU_DROPLET_ID" || return 1
 	write_state
 
 	# 3. Wait for SSH on both droplets before touching them.
@@ -767,18 +847,31 @@ cmd_start() {
 	_wait_ssh "$DO_CPU_PUBLIC_IP" || return 1
 	_wait_ssh "$DO_GPU_PUBLIC_IP" || return 1
 
-	# 4. Sync the app + provisioning scripts to /opt/app on both hosts.
+	# 4. Sync the app + provisioning scripts to /opt/app on both hosts. A fresh
+	# droplet's sshd can reset or stall the first transfers while cloud-init runs,
+	# so retry each step (all idempotent) rather than fail the whole start.
 	log_info "Syncing demo/ + infra/ to /opt/app on both droplets."
-	_ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
-	_ssh "$DO_GPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
-	_rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_CPU_PUBLIC_IP:/opt/app/" || return 1
-	_rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_GPU_PUBLIC_IP:/opt/app/" || return 1
+	_retry 5 _ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
+	_retry 5 _ssh "$DO_GPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
+	_retry 5 _rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_CPU_PUBLIC_IP:/opt/app/" || return 1
+	_retry 5 _rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_GPU_PUBLIC_IP:/opt/app/" || return 1
 
-	# 5. GPU: provision (F5), then pull the model (C8 — persists on /mnt/models).
-	log_info "Provisioning GPU droplet + pulling model '$OLLAMA_MODEL'."
-	_ssh "$DO_GPU_PUBLIC_IP" \
-		"MODELS_VOLUME_NAME=$DO_MODELS_VOLUME_NAME OLLAMA_HOST=0.0.0.0:11434 bash /opt/app/infra/provision-gpu.sh" || return 1
-	_ssh "$DO_GPU_PUBLIC_IP" "ollama pull $OLLAMA_MODEL" || return 1
+	# 5. Ollama node: provision (F5), then pull the model (C8 — persists on
+	# /mnt/models). Bind Ollama to the node's PRIVATE VPC IP (#19) so :11434 is off
+	# the public net with no firewall. The provisioning script depends on the
+	# backend (#18): CPU (plain Ubuntu, no NVIDIA) vs GPU. `ollama pull` must use
+	# the same private host — the CLI otherwise defaults to loopback.
+	ollama_bind="$DO_GPU_PRIVATE_IP:11434"
+	if [ "$OLLAMA_BACKEND" = gpu ]; then
+		log_info "Provisioning GPU Ollama node + pulling model '$OLLAMA_MODEL'."
+		_ssh "$DO_GPU_PUBLIC_IP" \
+			"MODELS_VOLUME_NAME=$DO_MODELS_VOLUME_NAME OLLAMA_HOST=$ollama_bind bash /opt/app/infra/provision-gpu.sh" || return 1
+	else
+		log_info "Provisioning CPU Ollama node + pulling model '$OLLAMA_MODEL'."
+		_ssh "$DO_GPU_PUBLIC_IP" \
+			"MODELS_VOLUME_NAME=$DO_MODELS_VOLUME_NAME OLLAMA_HOST=$ollama_bind bash /opt/app/infra/provision-ollama-cpu.sh" || return 1
+	fi
+	_ssh "$DO_GPU_PUBLIC_IP" "OLLAMA_HOST=$ollama_bind ollama pull $OLLAMA_MODEL" || return 1
 
 	# 6. CPU: provision (F5), copy creds (C9/ADR-0005), deploy the app (C10) as a
 	#    systemd unit wired to the GPU's PRIVATE Ollama URL (ADR-0007).

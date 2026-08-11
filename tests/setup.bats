@@ -69,6 +69,16 @@ EOF
 	grep -q "DO_CPU_SIZE='s-2vcpu-4gb'" "$CONFIG_DIR/config"
 	grep -q "DO_GPU_SIZE='gpu-4000adax1-20gb'" "$CONFIG_DIR/config"
 	grep -q "OLLAMA_MODEL='llama3.2:1b'" "$CONFIG_DIR/config"
+	# #18/#19: selectable backend (default cpu), CPU Ollama node size, optional firewall.
+	grep -q "OLLAMA_BACKEND='cpu'" "$CONFIG_DIR/config"
+	grep -q "DO_OLLAMA_CPU_SIZE='s-8vcpu-16gb-amd'" "$CONFIG_DIR/config"
+	grep -q "DO_ENABLE_FIREWALL='0'" "$CONFIG_DIR/config"
+}
+
+@test "setup records an OLLAMA_BACKEND env override (gpu)" {
+	OLLAMA_BACKEND=gpu run $DO setup --non-interactive
+	[ "$status" -eq 0 ]
+	grep -q "OLLAMA_BACKEND='gpu'" "$CONFIG_DIR/config"
 }
 
 @test "setup captures the DO-registered key name from doctl" {

@@ -122,12 +122,78 @@ least-privilege **custom-scoped** token, grant:
 The token is a secret — it lives in `~/.config/doctl`, **never** in the repo or
 `.do/`.
 
+### SSH key
+
+`digital-ocean setup` requires one SSH keypair that exists in **two** places, and
+its preflight fails until both are present:
+
+1. **Locally** — the CLI uses the private key to `ssh`/`rsync`/`scp` into the
+   droplets. It looks for `~/.ssh/id_ed25519` or `~/.ssh/id_rsa` (override the
+   path with `DO_SSH_KEY_FILE`).
+2. **Registered on DigitalOcean** — the *public* key is injected into every
+   droplet at create time so the private key above can log in.
+
+Both must be the **same keypair**. If you don't already have one on the scan
+path, generate a dedicated key and register it:
+
+```bash
+# 1. Generate a local ed25519 keypair at ~/.ssh/id_ed25519(.pub).
+ssh-keygen -t ed25519 -C "hello-digital-ocean" -f ~/.ssh/id_ed25519
+
+# 2. Register the PUBLIC half with DigitalOcean under a name you'll recognize.
+#    (Needs a token with `ssh_key: create`, or add it in the DO web console:
+#     Settings → Security → SSH keys.)
+doctl compute ssh-key import hello-do-key --public-key-file ~/.ssh/id_ed25519.pub
+
+# 3. Confirm DigitalOcean now lists it.
+doctl compute ssh-key list
+```
+
+The name you register (`hello-do-key` above) is what `setup` stores as
+`DO_SSH_KEY_NAME` in `.do/config`; `provision`/`start` resolve that name to the DO
+key ID. To **reuse an existing key** instead, register that key's `.pub`, then
+make sure `DO_SSH_KEY_NAME` matches its DO name **and** the matching private key
+is at `~/.ssh/id_ed25519`/`id_rsa` or pointed to by `DO_SSH_KEY_FILE`.
+
+> The `ssh_key` scope in the token table above is `read` — enough for
+> `provision`/`start` to resolve the key. Importing a key with `doctl` (step 2)
+> additionally needs `ssh_key: create`; the DO web console needs no token scope.
+
 ## User Guide
 
 <!-- How an end user runs and uses digital-ocean. Filled in as features land. -->
 Run `digital-ocean --help` (or `./bin/digital-ocean --help` from a fresh clone)
 for usage. Full command reference and the
 "Before you run `setup`" prerequisites checklist land with the docs feature (F10).
+
+### Lifecycle commands (start / stop / destroy)
+
+```bash
+# One-time, local only (no billable resources): preflight + interview + .do/config.
+digital-ocean setup            # add --non-interactive to accept defaults/env
+
+# Provision DO infra + deploy the demo end-to-end (BILLABLE — creates droplets).
+# Prints the public app URL + ready-to-paste ssh commands. Idempotent (re-run to
+# adopt + redeploy). Defaults to the cheap CPU Ollama backend (OLLAMA_BACKEND=cpu).
+digital-ocean start
+```
+
+**Tearing it down.** The friendly `digital-ocean stop` (destroy droplets, keep the
+two volumes) and `digital-ocean destroy` (also delete the volumes) commands are
+**built in F8 — not available yet** (tracked in
+[#7](https://github.com/Sdaas/hello-digital-ocean/issues/7)). Until they land, tear
+down with the low-level command `start` calls under the hood:
+
+```bash
+digital-ocean deprovision              # destroy both droplets, KEEP the volumes
+digital-ocean deprovision --volumes    # also destroy the volumes + VPC (full teardown)
+```
+
+> **Always tear down after a demo** — running droplets bill by the hour. Known
+> rough edges in `deprovision` today (fixed with F8, #7): it can report a volume
+> delete failure if you run it the instant droplets are still deleting (re-run it,
+> or delete the volumes a few seconds later), and it logs an error for a *default*
+> VPC, which cannot be deleted (harmless — VPCs are free).
 
 ## Developer Guide
 
