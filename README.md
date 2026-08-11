@@ -178,22 +178,21 @@ digital-ocean setup            # add --non-interactive to accept defaults/env
 digital-ocean start
 ```
 
-**Tearing it down.** The friendly `digital-ocean stop` (destroy droplets, keep the
-two volumes) and `digital-ocean destroy` (also delete the volumes) commands are
-**built in F8 — not available yet** (tracked in
-[#7](https://github.com/Sdaas/hello-digital-ocean/issues/7)). Until they land, tear
-down with the low-level command `start` calls under the hood:
+**Tearing it down.**
 
 ```bash
-digital-ocean deprovision              # destroy both droplets, KEEP the volumes
-digital-ocean deprovision --volumes    # also destroy the volumes + VPC (full teardown)
+digital-ocean stop        # destroy the droplets + firewalls, KEEP the volumes + VPC
+digital-ocean destroy     # full teardown: also delete the volumes + VPC (confirms first)
+digital-ocean destroy -y  # same, without the confirmation prompt
 ```
 
-> **Always tear down after a demo** — running droplets bill by the hour. Known
-> rough edges in `deprovision` today (fixed with F8, #7): it can report a volume
-> delete failure if you run it the instant droplets are still deleting (re-run it,
-> or delete the volumes a few seconds later), and it logs an error for a *default*
-> VPC, which cannot be deleted (harmless — VPCs are free).
+`stop` stops the compute billing but keeps your data on the volumes, so a later
+`digital-ocean start` re-adopts them. `destroy` removes everything (all data lost);
+it prompts for a typed `yes` unless you pass `-y` / `--non-interactive`. Both wait
+for the droplets to finish deleting before touching the volumes, and both tolerate
+a *default* VPC (which DigitalOcean will not delete — harmless, VPCs are free).
+
+> **Always tear down after a demo** — running droplets bill by the hour.
 
 ## Developer Guide
 
