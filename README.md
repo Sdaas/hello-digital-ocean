@@ -47,6 +47,29 @@ interview → design → test-first code → review → ship, with a human in th
 
 > The repo is *named* `hello-digital-ocean`; the *binary* is `digital-ocean`.
 
+## Before you run `setup`
+
+`digital-ocean setup` preflights your machine, but you'll have a smoother first
+run if these are in place first. Tick each one — the "how" for the DigitalOcean-
+specific items is in [Setup](#setup) below.
+
+- [ ] **macOS** control host with **Homebrew** — the CLI targets macOS (see
+      [Platform support](#platform-support)).
+- [ ] **git** and **gh** (GitHub CLI), and `gh` is **authenticated**
+      (`gh auth status`). Run `./setup.sh --verify` to check.
+- [ ] **doctl** installed (`brew install doctl`) and authenticated
+      (`doctl auth init` → `doctl account get` succeeds). See
+      [DigitalOcean access](#digitalocean-access-doctl) for the token + scopes.
+- [ ] An **SSH keypair** that exists in **both** places — locally at
+      `~/.ssh/id_ed25519` (or `id_rsa`, or `DO_SSH_KEY_FILE`) **and** registered
+      on DigitalOcean under the name you'll set as `DO_SSH_KEY_NAME`. See
+      [SSH key](#ssh-key).
+- [ ] You understand this creates **billable** cloud resources when you run
+      `start` — read [Cost](#cost) and plan to `stop`/`destroy` afterward.
+
+Everything above is **local and free**. No DigitalOcean resources are created
+until you run `digital-ocean start`.
+
 ## Quick Start
 
 ```bash
@@ -161,10 +184,38 @@ is at `~/.ssh/id_ed25519`/`id_rsa` or pointed to by `DO_SSH_KEY_FILE`.
 
 ## User Guide
 
-<!-- How an end user runs and uses digital-ocean. Filled in as features land. -->
+<!-- How an end user runs and uses digital-ocean. -->
 Run `digital-ocean --help` (or `./bin/digital-ocean --help` from a fresh clone)
-for usage. Full command reference and the
-"Before you run `setup`" prerequisites checklist land with the docs feature (F10).
+for the built-in usage. The full reference:
+
+### Command reference
+
+Usage: `digital-ocean [--help] [--verbose] [<command>]`. With no command it
+prints a short banner.
+
+| Command | Billing | What it does |
+|---|---|---|
+| `setup` | local · free | One-time preflight + interview → writes `.do/config`. Add `--non-interactive` to accept defaults/env with no prompts. |
+| `local` | local · free | Run the demo app on your Mac (venv + Flask + browser). |
+| `local down` | local · free | Stop the locally running demo app. |
+| `start` | **BILLABLE** | Provision DO infra + deploy the demo end-to-end; prints the public URL + ssh commands when healthy. Idempotent (re-run to adopt + redeploy). |
+| `stop` | frees compute | Tear down droplets + firewalls; **keep** volumes + VPC so a later `start` reuses the data. Stops compute billing. |
+| `destroy` | frees all | Full teardown: droplets + firewalls + volumes + VPC (**all data lost**). Prompts to confirm; `-y` / `--non-interactive` skips the prompt. |
+
+**Debug helpers** (need a running host — see `start`):
+
+| Command | What it does |
+|---|---|
+| `ssh [cpu\|gpu] [cmd...]` | Open a root shell on the droplet (default `cpu`), or run `cmd` there one-shot — e.g. `digital-ocean ssh gpu nvidia-smi`. |
+| `logs [cpu\|gpu] [-f]` | Tail the service journal (`cpu`=app, `gpu`=ollama; default `cpu`). `-f`/`--follow` streams instead of the last 100 lines. |
+| `status [cpu\|gpu]` | Service state + health probe. No target → probes **both** nodes. |
+
+**Global flags:** `--help` prints usage; `--verbose` enables verbose logging.
+
+**Backend & region.** `start` defaults to the cheap CPU Ollama backend
+(`OLLAMA_BACKEND=cpu`, provisioned in `blr1`). Set `OLLAMA_BACKEND=gpu` for the
+GPU backend (provisioned in `tor1`). An explicit `DO_REGION` overrides the
+backend-derived region.
 
 ### Lifecycle commands (start / stop / destroy)
 
@@ -192,7 +243,54 @@ it prompts for a typed `yes` unless you pass `-y` / `--non-interactive`. Both wa
 for the droplets to finish deleting before touching the volumes, and both tolerate
 a *default* VPC (which DigitalOcean will not delete — harmless, VPCs are free).
 
-> **Always tear down after a demo** — running droplets bill by the hour.
+> **Always tear down after a demo** — running droplets bill by the hour. See
+> [Cost](#cost).
+
+### Cost
+
+`start` creates **billable** DigitalOcean resources that bill *by the hour while
+they exist*. With the default CPU backend (`OLLAMA_BACKEND=cpu`) `start`
+provisions:
+
+| Resource | Default size slug | Notes |
+|---|---|---|
+| Control droplet (app) | `s-2vcpu-4gb` | Runs the demo app. |
+| Ollama node (CPU backend) | `s-8vcpu-16gb-amd` | Replaced by a GPU droplet when `OLLAMA_BACKEND=gpu`. |
+| Ollama node (GPU backend) | `gpu-6000adax1-48gb` | Only with `OLLAMA_BACKEND=gpu`; the priciest line item by far. |
+| Block-storage volumes | 2 volumes | Persist across `stop`; billed per-GiB until `destroy`. |
+
+Order of magnitude: the CPU backend is a few US cents per hour of compute; the
+**GPU backend costs roughly an order of magnitude more** per hour. Exact prices
+change — check DigitalOcean's pricing pages for the current rate of each slug:
+
+- Droplets & GPU droplets: <https://www.digitalocean.com/pricing/droplets>
+- Block storage volumes: <https://www.digitalocean.com/pricing/block-storage>
+
+To stop spending:
+
+- `digital-ocean stop` — frees the (expensive) compute but **keeps** the volumes,
+  which keep billing at the small per-GiB rate.
+- `digital-ocean destroy` — frees **everything**, including the volumes. Nothing
+  left to bill.
+
+> Rule of thumb: **`stop` or `destroy` the moment a demo is over.** A GPU droplet
+> left running overnight is the one line item that stings.
+
+## Platform support
+
+The **`digital-ocean` control CLI runs on macOS** — that's what it's developed
+and tested on. A Linux control host is not currently supported; known macOS
+assumptions you'd hit there:
+
+- **`local` / `start`** open your browser with macOS `open`. On Linux the app
+  still runs; you'd just open the printed URL yourself (or set
+  `DO_LOCAL_NO_BROWSER=1`).
+- **`./setup.sh`** installs dependencies via Homebrew (`brew`); on other
+  platforms it only *reports* what to install by hand.
+
+The **droplets** provisioned in the cloud are **Ubuntu** — that's the intended
+Linux surface, provisioned automatically over SSH (`infra/`). You interact with
+them through `ssh`/`logs`/`status`, so you don't administer them by hand.
 
 ## Developer Guide
 
