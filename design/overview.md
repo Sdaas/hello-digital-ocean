@@ -109,6 +109,25 @@ This file remains the home for design notes that emerge during per-feature
   2026-08-10); the **attach positive path and real
   droplet create are deferred to F7** (billable/GPU), mirroring F5's deferred
   volume-mount VERIFY.
+- **`digital-ocean start` orchestration (F7):** the public end-to-end command that
+  ties F4/F5/F6 together. It **reuses F6's `cmd_provision`** (adopt-or-create VPC +
+  volumes + droplets + attach → `.do/state`), then ensures **two DO cloud firewalls**
+  (`hello-do-cpu-fw`: `:5000`+`:22` public; `hello-do-gpu-fw`: `:11434` from the **VPC
+  IP range** only + `:22`) to honor ADR-0007 (Ollama binds `0.0.0.0`, so a firewall —
+  not just the VPC — is what keeps `:11434` off the public net); firewall IDs are added
+  to `.do/state`. It waits for SSH (**`accept-new`** host keys → `.do/known_hosts`),
+  **`rsync`s** `demo/`+`infra/` to `/opt/app` on both droplets, runs the F5
+  `provision-gpu.sh` then **`ollama pull`** (C8 — persists on `/mnt/models`, so re-run
+  is a no-op), runs `provision-cpu.sh`, **`scp`s the creds** file → `/etc/app/credentials`
+  (C9, ADR-0005), and deploys the F2 app as a **systemd `app.service`** (`APP_ENV=DO_DEMO`,
+  `OLLAMA_URL=http://<GPU_PRIVATE_IP>:11434` per ADR-0007, `APP_DATA_DIR=/mnt/data`) —
+  C10/C11. **Health checks**: Ollama `/api/tags` over the private IP + app `/health`;
+  then stdout prints the public URL + paste-ready `ssh` commands (ADR-0006). **Idempotent**
+  (re-run adopts/re-syncs/restarts). The `doctl`/`ssh`/`scp`/`rsync`/`ollama` boundaries
+  are PATH-shimmed in the fast lane (`tests/do-start.bats`), which obligates the opt-in,
+  self-skipping `tests/integration/do-start.bats` (`DO_REAL_START=1`) **plus a billable
+  live VERIFY** (the un-mocked GPU/ssh/Ollama evidence F5/F6 deferred here). **F8 handoff:**
+  `stop`/`destroy` should also clean up the two firewalls.
 - **Python test lane (F2):** the demo app's `pytest` suite is wired into
   `./test.sh` alongside bats (pytest treated as a dev dependency, like bats). The
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
