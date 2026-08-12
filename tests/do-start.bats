@@ -61,7 +61,7 @@ _shim_doctl() {
 	cat >"$SHIM/doctl" <<'EOF'
 #!/usr/bin/env bash
 REG="${DOCTL_REG:?}"; RES="$REG/resources"; ATT="$REG/attach"; CALLS="$REG/calls"; FW="$REG/fw"
-: >>"$RES"; : >>"$ATT"; : >>"$CALLS"; : >>"$FW"
+: >>"$RES"; : >>"$ATT"; : >>"$CALLS"; : >>"$FW"; : >>"$REG/assign"
 printf '%s\n' "$*" >>"$CALLS"
 
 # Real doctl's `vpcs create` does NOT support --format (unlike volume/droplet
@@ -124,6 +124,18 @@ case "$key" in
 	esac;;
 "compute ssh-key")
 	printf '%s %s\n' "${DOCTL_KEY_NAME:-my-mac}" "111";;
+"projects list")
+	awk '$1=="project"{print $3, $2}' "$RES";;
+"projects create")
+	id="$(_id "$name")"; [ -n "$(_find_id project "$name")" ] || _add project "$name" "$id" - -
+	printf '%s\n' "$id";;
+"projects resources")
+	if [ "${args[2]:-}" = assign ]; then
+		pid="${args[3]:-}"
+		for u in "${args[@]}"; do
+			case "$u" in do:*) printf '%s %s\n' "$pid" "$u" >>"$REG/assign";; esac
+		done
+	fi;;
 "compute firewall")
 	case "${args[2]:-}" in
 	list) awk '$1=="fw"{print $2, $3}' "$RES";;
@@ -234,6 +246,14 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$(_count volume)" -eq 2 ]
 	grep -q "id-demo-prod-data id-demo-prod-backend" "$REG/attach"
 	grep -q "id-demo-prod-models id-demo-prod-ollama-cpu" "$REG/attach"
+}
+
+@test "#30: start groups the resources under the demo-prod DO Project" {
+	run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	grep -q "DO_PROJECT_NAME='demo-prod'" "$CONFIG_DIR/state.prod"
+	grep -q "id-demo-prod do:droplet:id-demo-prod-backend" "$REG/assign"
+	grep -q "id-demo-prod do:volume:id-demo-prod-models" "$REG/assign"
 }
 
 # --- firewall: optional (#19) -----------------------------------------------

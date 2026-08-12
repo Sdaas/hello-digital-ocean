@@ -31,6 +31,8 @@ setup() {
 # stay manifest-free.
 _write_state() {
 	cat >"$CONFIG_DIR/state.prod" <<EOF
+DO_PROJECT_ID='id-demo-prod'
+DO_PROJECT_NAME='demo-prod'
 DO_CPU_PUBLIC_IP='203.0.113.10'
 DO_CPU_PRIVATE_IP='10.0.0.10'
 DO_GPU_PUBLIC_IP='203.0.113.20'
@@ -132,6 +134,12 @@ EOF
 	[ "$status" -eq 0 ]
 	grep -q 'root@203.0.113.10' "$LOG/ssh"
 	grep -q 'root@203.0.113.20' "$LOG/ssh"
+}
+
+@test "#30: status notes the DO Project the resources are grouped under" {
+	run "$DO" status
+	[ "$status" -eq 0 ]
+	printf '%s' "$output" | grep -qi "Project 'demo-prod'"
 }
 
 @test "status gpu reports only the GPU node" {
