@@ -44,10 +44,11 @@ _write_config() {
 DO_REGION='blr1'
 DO_CPU_SIZE='s-2vcpu-4gb'
 DO_GPU_SIZE='gpu-6000adax1-48gb'
-OLLAMA_MODEL='llama3.2:1b'
 DO_SSH_KEY_NAME='my-mac'
 APP_CREDENTIALS_FILE='$CONFIG_DIR/credentials'
 EOF
+	# #27 (F11): the model is a per-app fact, read from the manifest (--app-dir demo),
+	# NOT from the infra config — so it is deliberately absent above.
 }
 
 _write_creds() {
@@ -219,7 +220,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 # --- happy path -------------------------------------------------------------
 
 @test "start provisions, deploys, health-checks and prints the public URL (exit 0)" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# stdout carries the public UI URL (data) — CPU public IP : 5000.
 	echo "$output" | grep -q "http://203.0.113.10:5000"
@@ -229,7 +230,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 }
 
 @test "start reuses F6 provisioning — VPC, volumes, droplets, attach, state" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	[ -f "$CONFIG_DIR/state" ]
 	[ "$(_count droplet)" -eq 2 ]
@@ -242,7 +243,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 
 @test "start skips DO firewalls by default (private-IP bind is the control) and still succeeds" {
 	# _write_config sets no DO_ENABLE_FIREWALL, so the default (0/off) applies.
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# No firewall was created or assigned…
 	[ ! -s "$REG/fw" ] || run grep -q "create hello-do" "$REG/fw"
@@ -254,7 +255,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 }
 
 @test "start ensures two firewalls when DO_ENABLE_FIREWALL=1: cpu (5000+22 public) and gpu (11434 from VPC)" {
-	DO_ENABLE_FIREWALL=1 run $DO start
+	DO_ENABLE_FIREWALL=1 run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# Both firewalls created and recorded in state.
 	grep -q "create hello-do-cpu-fw" "$REG/fw"
@@ -275,27 +276,25 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 
 @test "start hard-fails when a firewall is requested (=1) but the token lacks scope" {
 	export DOCTL_FW_DENY=1
-	DO_ENABLE_FIREWALL=1 run $DO start
+	DO_ENABLE_FIREWALL=1 run $DO --app-dir demo start
 	[ "$status" -ne 0 ]
 	# Points the operator at the scope issue (#16) rather than silently continuing.
 	echo "$output" | grep -qi "firewall"
 }
 
-@test "start rsyncs demo+infra to /opt/app on BOTH droplets" {
-	run $DO start
+@test "start rsyncs the app to /opt/app/app and infra to /opt/app on BOTH droplets" {
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
-	# One rsync per host, into /opt/app.
-	grep -q "203.0.113.10:/opt/app" "$LOG/rsync"
-	grep -q "203.0.113.20:/opt/app" "$LOG/rsync"
-	# demo/ and infra/ are part of the synced tree.
-	grep -q "demo" "$LOG/rsync"
+	# #27: app CODE lands at /opt/app/app (not a demo/-named path); infra is tool-owned.
+	grep -q "203.0.113.10:/opt/app/app" "$LOG/rsync"
+	grep -q "203.0.113.20:/opt/app/app" "$LOG/rsync"
 	grep -q "infra" "$LOG/rsync"
 }
 
 # --- Ollama node: backend selection (#18) + private-IP bind (#19) -----------
 
 @test "default (cpu) backend: provisions the CPU Ollama node and pulls the model" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# The Ollama node (the DO_GPU_* droplet) runs the CPU provisioning script — NOT the GPU one.
 	node="$(_ssh_to 203.0.113.20)"
@@ -307,7 +306,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 }
 
 @test "cpu backend: Ollama is bound to the node's PRIVATE VPC IP, not 0.0.0.0 (#19)" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	node="$(_ssh_to 203.0.113.20)"
 	# The provisioning step binds Ollama to the private IP…
@@ -318,7 +317,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 }
 
 @test "gpu backend: provisions the GPU Ollama node with provision-gpu.sh" {
-	OLLAMA_BACKEND=gpu run $DO start
+	OLLAMA_BACKEND=gpu run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	node="$(_ssh_to 203.0.113.20)"
 	echo "$node" | grep -q "provision-gpu.sh"
@@ -327,7 +326,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 }
 
 @test "cpu backend: the Ollama droplet is created with the CPU size (DO_OLLAMA_CPU_SIZE default)" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
 	echo "$node_create" | grep -q "s-8vcpu-16gb-amd"
@@ -335,41 +334,58 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 }
 
 @test "gpu backend: the Ollama droplet is created with the GPU size" {
-	OLLAMA_BACKEND=gpu run $DO start
+	OLLAMA_BACKEND=gpu run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
 	echo "$node_create" | grep -q "gpu-6000adax1-48gb"
 }
 
-@test "start runs provision-cpu.sh with the data volume on the CPU droplet" {
-	run $DO start
+@test "start runs provision-cpu.sh with the data volume + manifest requirements on the CPU droplet" {
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	cpu="$(_ssh_to 203.0.113.10)"
 	echo "$cpu" | grep -q "provision-cpu.sh"
 	echo "$cpu" | grep -q "DATA_VOLUME_NAME=hello-do-data"
+	# #27: the CLI drives the tool-owned infra script with the manifest's
+	# requirements at the app's /opt/app/app location (no hardcoded demo/ path).
+	echo "$cpu" | grep -q "REQUIREMENTS_FILE=/opt/app/app/requirements.txt"
 }
 
 @test "start scps the credentials file to /etc/app/credentials on the CPU" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# scp of the local creds file to the CPU's /etc/app/credentials.
 	grep -q "credentials" "$LOG/scp"
 	grep -q "203.0.113.10:/etc/app/credentials" "$LOG/scp"
 }
 
-@test "start deploys the demo app as a systemd unit wired to the GPU's PRIVATE Ollama URL" {
-	run $DO start
+@test "start deploys the app as a systemd unit with the explicit manifest env contract" {
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	cpu="$(_ssh_to 203.0.113.10)"
-	# APP_ENV=DO_DEMO and the private-IP Ollama URL (ADR-0007) reach the CPU.
-	echo "$cpu" | grep -q "APP_ENV=DO_DEMO"
+	# #27: NO demo-specific APP_ENV — the CLI sets the contract explicitly instead.
+	[ "$(echo "$cpu" | grep -c "APP_ENV=")" -eq 0 ]
+	# Explicit bind + private-IP Ollama URL (ADR-0007) + manifest port/model.
+	echo "$cpu" | grep -q "HOST=0.0.0.0"
+	echo "$cpu" | grep -q "PORT=5000"
 	echo "$cpu" | grep -q "OLLAMA_URL=http://10.10.0.20:11434"
+	echo "$cpu" | grep -q "OLLAMA_MODEL=llama3.2:1b"
+	# ExecStart runs the manifest entrypoint from the app's /opt/app/app location.
+	echo "$cpu" | grep -q "/opt/app/app/app.py"
 	# Deployed via systemd (app.service enabled/started), not nohup.
 	echo "$cpu" | grep -qE "systemctl (enable|restart|start).*app"
 }
 
+@test "start records the app port + health path in .do/state (F9 reads them)" {
+	run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	# #27: the deployed app facts land in state so status/logs stay manifest-free.
+	grep -q "APP_PORT='5000'" "$CONFIG_DIR/state"
+	grep -q "APP_HEALTH_PATH='/health'" "$CONFIG_DIR/state"
+}
+
 @test "start health-checks Ollama (private) and the app /health, then reports healthy" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	cpu="$(_ssh_to 203.0.113.10)"
 	# Ollama reachability is checked over the PRIVATE IP from the CPU side.
@@ -381,10 +397,10 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 # --- idempotency ------------------------------------------------------------
 
 @test "re-running start adopts everything — no duplicate resources, no new create" {
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	: >"$REG/calls"
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	[ "$(_count droplet)" -eq 2 ]
 	[ "$(_count volume)" -eq 2 ]
@@ -398,7 +414,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 
 @test "start without a config fails and provisions nothing" {
 	rm -f "$CONFIG_DIR/config"
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -q "setup"
 	run grep -E "create" "$REG/calls"
@@ -409,7 +425,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	# Fresh droplets can reset/stall the first transfer under cloud-init; the CLI
 	# must retry rather than fail the whole start (found at #18 live VERIFY).
 	printf '2\n' >"$LOG/rsync_fail"   # first two rsync attempts fail, then succeed
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# The sync still landed on both droplets after the retries.
 	grep -q "203.0.113.10:/opt/app" "$LOG/rsync"
@@ -418,21 +434,21 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 
 @test "start gives up if rsync never succeeds (bounded retries, non-zero)" {
 	printf '99\n' >"$LOG/rsync_fail"   # fail far more than the retry budget
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -ne 0 ]
 }
 
 @test "start waits for SSH to come up, then proceeds (exit 0)" {
 	# First two ssh connects are refused; the wait loop must retry to success.
 	printf '2\n' >"$LOG/ssh_notready"
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 }
 
 @test "start fails (non-zero) when SSH never becomes reachable" {
 	# Refuse far more connects than the (small) wait budget allows.
 	printf '9999\n' >"$LOG/ssh_notready"
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -qi "ssh"
 }
@@ -440,7 +456,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "start fails (non-zero) when the app health check never passes" {
 	# Make the app-health probe fail on the remote side.
 	printf '5000/health\n' >"$LOG/ssh_fail"
-	run $DO start
+	run $DO --app-dir demo start
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -qi "health"
 }
@@ -455,6 +471,6 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 
 @test "start runs under zsh" {
 	if ! command -v zsh >/dev/null 2>&1; then skip "zsh not installed"; fi
-	run zsh ./bin/digital-ocean start
+	run zsh ./bin/digital-ocean --app-dir demo start
 	[ "$status" -eq 0 ]
 }

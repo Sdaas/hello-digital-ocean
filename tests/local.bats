@@ -45,7 +45,7 @@ EOF
 
 @test "local fails fast when Ollama is unreachable and starts no app" {
 	_shim_curl_unreachable
-	run $DO local
+	run $DO --app-dir demo local
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -q "ollama serve"
 	[ ! -f "$STATE_DIR/local.pid" ]

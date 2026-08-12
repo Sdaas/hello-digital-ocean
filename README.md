@@ -13,22 +13,26 @@ CLI that provisions and tears down the DigitalOcean infrastructure (a CPU
 droplet + a GPU droplet + persistent volumes) and runs an app on it:
 
 ```bash
-digital-ocean setup      # one-time local preflight + config
-digital-ocean start      # provision the infra and bring the demo up
-digital-ocean stop       # destroy droplets, keep volumes (pause billing)
-digital-ocean destroy    # remove everything
-digital-ocean local      # run the app on your Mac, no cloud
+digital-ocean setup                        # one-time local preflight + config
+digital-ocean --app-dir demo start         # provision the infra and bring the app up
+digital-ocean stop                         # destroy droplets, keep volumes (pause billing)
+digital-ocean destroy                      # remove everything
+digital-ocean --app-dir demo local         # run the app on your Mac, no cloud
 ```
 
 > These `digital-ocean …` examples assume the CLI is on your `PATH`. From a
 > fresh clone the binary lives at `./bin/digital-ocean`; symlink it once to run
 > it from anywhere (see [Quick Start](#quick-start)).
 
-To prove the CLI actually works, the repo ships a small **demo app** in
-[`demo/`](demo/) — a self-contained chatbot (web UI + Flask backend that keeps
-conversation history + Ollama model backend). The demo app is the *reference
-workload*: once the `digital-ocean` lifecycle is proven against it, a real
-application can be dropped in behind the same infrastructure unchanged.
+The CLI deploys **any conforming app**, not a single bundled one. You point it at
+an app with **`--app-dir <dir>`** (required by `local` and `start`); that
+directory must hold a **`digital-ocean.yml`** manifest describing the app (see
+[App manifest](#app-manifest)). To prove the CLI works, the repo ships a small
+**demo app** in [`demo/`](demo/) — a self-contained chatbot (web UI + Flask
+backend that keeps conversation history + Ollama model backend) with its own
+[`demo/digital-ocean.yml`](demo/digital-ocean.yml). The demo is the *reference
+workload*: once the lifecycle is proven against it, a real application drops in
+behind the same infrastructure by shipping its own manifest.
 
 This is a cli (shell). It is developed using an agentic SDLC:
 interview → design → test-first code → review → ship, with a human in the loop.
@@ -190,15 +194,15 @@ for the built-in usage. The full reference:
 
 ### Command reference
 
-Usage: `digital-ocean [--help] [--verbose] [<command>]`. With no command it
-prints a short banner.
+Usage: `digital-ocean [--help] [--verbose] [--app-dir <dir>] [<command>]`. With no
+command it prints a short banner.
 
 | Command | Billing | What it does |
 |---|---|---|
 | `setup` | local · free | One-time preflight + interview → writes `.do/config`. Add `--non-interactive` to accept defaults/env with no prompts. |
-| `local` | local · free | Run the demo app on your Mac (venv + Flask + browser). |
-| `local down` | local · free | Stop the locally running demo app. |
-| `start` | **BILLABLE** | Provision DO infra + deploy the demo end-to-end; prints the public URL + ssh commands when healthy. Idempotent (re-run to adopt + redeploy). |
+| `local` | local · free | Run the app on your Mac (venv + browser). **Needs `--app-dir`.** |
+| `local down` | local · free | Stop the locally running app. |
+| `start` | **BILLABLE** | Provision DO infra + deploy the app end-to-end; prints the public URL + ssh commands when healthy. Idempotent (re-run to adopt + redeploy). **Needs `--app-dir`.** |
 | `stop` | frees compute | Tear down droplets + firewalls; **keep** volumes + VPC so a later `start` reuses the data. Stops compute billing. |
 | `destroy` | frees all | Full teardown: droplets + firewalls + volumes + VPC (**all data lost**). Prompts to confirm; `-y` / `--non-interactive` skips the prompt. |
 
@@ -210,7 +214,32 @@ prints a short banner.
 | `logs [cpu\|gpu] [-f]` | Tail the service journal (`cpu`=app, `gpu`=ollama; default `cpu`). `-f`/`--follow` streams instead of the last 100 lines. |
 | `status [cpu\|gpu]` | Service state + health probe. No target → probes **both** nodes. |
 
-**Global flags:** `--help` prints usage; `--verbose` enables verbose logging.
+**Global flags:** `--help` prints usage; `--verbose` enables verbose logging;
+`--app-dir <dir>` selects the app to run/deploy (the dir holding
+`digital-ocean.yml`; required by `local`/`start`, also settable via `$DO_APP_DIR`).
+
+### App manifest
+
+`local` and `start` deploy the app named by `--app-dir <dir>`. That directory
+must contain a **`digital-ocean.yml`** manifest — the CLI reads it instead of
+assuming anything app-specific. The reference is
+[`demo/digital-ocean.yml`](demo/digital-ocean.yml):
+
+```yaml
+app_dir: .                 # app code root, relative to this manifest (rsynced to /opt/app/app)
+entrypoint: app.py         # python entrypoint, relative to app_dir
+requirements: requirements.txt   # pip -r target, relative to app_dir
+port: 5000                 # port the app binds/serves on
+health_path: /health       # readiness endpoint (must report app + Ollama health)
+ollama_model: llama3.2:1b  # model the app needs (pulled on the Ollama node)
+credentials_env_file: true # ship /etc/app/credentials as a systemd EnvironmentFile
+```
+
+The CLI drives the app purely through an **environment contract**: it sets
+`HOST`/`PORT`, `OLLAMA_URL`/`OLLAMA_MODEL`, `APP_DATA_DIR`, and (when
+`credentials_env_file` is on) loads `/etc/app/credentials`. Your app reads those
+env vars — locally it binds `127.0.0.1:<port>`, on DO `0.0.0.0:<port>`. `infra/`
+stays tool-owned; only the manifest changes per app.
 
 **Backend & region.** `start` defaults to the cheap CPU Ollama backend
 (`OLLAMA_BACKEND=cpu`, provisioned in `blr1`). Set `OLLAMA_BACKEND=gpu` for the
@@ -223,10 +252,10 @@ backend-derived region.
 # One-time, local only (no billable resources): preflight + interview + .do/config.
 digital-ocean setup            # add --non-interactive to accept defaults/env
 
-# Provision DO infra + deploy the demo end-to-end (BILLABLE — creates droplets).
+# Provision DO infra + deploy the app end-to-end (BILLABLE — creates droplets).
 # Prints the public app URL + ready-to-paste ssh commands. Idempotent (re-run to
 # adopt + redeploy). Defaults to the cheap CPU Ollama backend (OLLAMA_BACKEND=cpu).
-digital-ocean start
+digital-ocean --app-dir demo start
 ```
 
 **Tearing it down.**
@@ -254,7 +283,7 @@ provisions:
 
 | Resource | Default size slug | Notes |
 |---|---|---|
-| Control droplet (app) | `s-2vcpu-4gb` | Runs the demo app. |
+| Control droplet (app) | `s-2vcpu-4gb` | Runs the app. |
 | Ollama node (CPU backend) | `s-8vcpu-16gb-amd` | Replaced by a GPU droplet when `OLLAMA_BACKEND=gpu`. |
 | Ollama node (GPU backend) | `gpu-6000adax1-48gb` | Only with `OLLAMA_BACKEND=gpu`; the priciest line item by far. |
 | Block-storage volumes | 2 volumes | Persist across `stop`; billed per-GiB until `destroy`. |

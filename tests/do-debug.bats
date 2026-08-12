@@ -26,13 +26,17 @@ setup() {
 	export PATH="$SHIM:/usr/bin:/bin"
 }
 
-# A .do/state as F6/F7 would have written it (only the fields F9 reads).
+# A .do/state as F6/F7 would have written it (only the fields F9 reads). #27:
+# start now records the deployed app's port + health path here so status/logs
+# stay manifest-free.
 _write_state() {
 	cat >"$CONFIG_DIR/state" <<EOF
 DO_CPU_PUBLIC_IP='203.0.113.10'
 DO_CPU_PRIVATE_IP='10.0.0.10'
 DO_GPU_PUBLIC_IP='203.0.113.20'
 DO_GPU_PRIVATE_IP='10.0.0.20'
+APP_PORT='5000'
+APP_HEALTH_PATH='/health'
 EOF
 }
 
@@ -142,6 +146,17 @@ EOF
 	[ "$status" -eq 0 ]
 	grep -q 'is-active.*app.service' "$LOG/ssh"
 	grep -q '5000/health' "$LOG/ssh"
+}
+
+@test "status probes the app port + health path recorded in state, not a hardcoded 5000" {
+	# #27: prove the cpu health probe is state-driven — a non-default port/path
+	# from .do/state must be what gets probed.
+	printf "DO_CPU_PUBLIC_IP='203.0.113.10'\nAPP_PORT='8080'\nAPP_HEALTH_PATH='/healthz'\n" \
+		>"$CONFIG_DIR/state"
+	run "$DO" status cpu
+	[ "$status" -eq 0 ]
+	grep -q '8080/healthz' "$LOG/ssh"
+	[ "$(grep -c '5000/health' "$LOG/ssh")" -eq 0 ]
 }
 
 @test "status gpu probes the ollama /api/tags endpoint" {

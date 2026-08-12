@@ -214,6 +214,27 @@ This file remains the home for design notes that emerge during per-feature
   Ollama network boundary is mocked in the fast lane, which obligates an opt-in,
   self-skipping real-Ollama test under `tests/integration/` (run by
   `./test.sh --integration`); CI installs the demo deps and runs the fast lane.
+- **Manifest-driven app config (F11, #27):** the CLI deploys **any** conforming
+  app, not just `demo/`. A per-app **`digital-ocean.yml`** manifest (in the app
+  dir) carries the app's facts — `app_dir`, `entrypoint`, `requirements`, `port`,
+  `health_path`, `ollama_model`, `credentials_env_file` — and the CLI reads them
+  instead of hardcoding `demo/`. `infra/` stays **tool-owned**. Key decisions:
+  (1) **`--app-dir <dir>` is required** for `local`/`start` (a **breaking change** —
+  no CWD/`demo/` fallback); manifest = `<app-dir>/digital-ocean.yml`.
+  (2) **Explicit env contract, no `APP_ENV`:** the CLI sets `HOST`/`PORT`/`OLLAMA_URL`/
+  `OLLAMA_MODEL`/`APP_DATA_DIR`/`APP_CREDENTIALS_FILE` **explicitly** (local: 127.0.0.1;
+  cloud: 0.0.0.0) — `config.py` already lets each override its profile default, so the
+  demo binds identically without the demo-specific `APP_ENV=DO_DEMO`/`LOCAL`.
+  (3) **`ollama_model` moves out of `.do/config`/`setup` into the manifest** (it is a
+  per-app fact); `start` reads it from the manifest.
+  (4) App code always lands at **`/opt/app/app`** (rsync of `<app_dir>`), `infra/` at
+  `/opt/app/infra`; `ExecStart=/opt/app/.venv/bin/python /opt/app/app/<entrypoint>`.
+  (5) `start` records **`APP_PORT` + `APP_HEALTH_PATH` in `.do/state`** so the F9
+  `status`/`logs` helpers stay manifest-free (they read the deployed truth from state).
+  (6) YAML is parsed by a **minimal flat `key: value`** reader in pure sh (no
+  `jq`/`yq` — matches the repo's dependency-light ethos); a code note flags that a
+  real YAML parser is warranted **only if** the manifest grows nested structure (YAGNI).
+  `demo/digital-ocean.yml` is the reference manifest; the demo runs via `--app-dir demo`.
 
 ## Constraints
 
