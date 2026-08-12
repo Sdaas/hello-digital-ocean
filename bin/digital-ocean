@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 #
-# digital-ocean — control CLI for the DigitalOcean demo host.
+# digital-ocean — control CLI for DigitalOcean app hosts.
 #
 # This is the MAIN ARTIFACT of the hello-digital-ocean repo: a Mac-side control
 # CLI that provisions and tears down the DigitalOcean infrastructure (droplets +
-# volumes) and runs the reference "demo" app on it — e.g. `digital-ocean start`,
-# `digital-ocean stop`, `digital-ocean setup`, `digital-ocean destroy`,
-# `digital-ocean local`. The cloud subcommands are added by later features
-# (F4–F9); F3 ships the first real subcommand, `local`, plus the subcommand
-# dispatcher those siblings build on.
+# volumes) and runs a conforming app on it — chosen with `--app-dir <dir>` and its
+# digital-ocean.yml manifest (F11/#27; the bundled `demo/` is the reference app).
+# E.g. `digital-ocean --app-dir demo start`, `digital-ocean stop`,
+# `digital-ocean setup`, `digital-ocean destroy`, `digital-ocean --app-dir demo local`.
+# The cloud subcommands are added by later features (F4–F9); F3 ships the first
+# real subcommand, `local`, plus the subcommand dispatcher those siblings build on.
 #
 # Written to run under both bash and zsh: avoids bash-only features
 # (no arrays, no ${BASH_SOURCE}). Keep it that way.
@@ -19,19 +20,22 @@ set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Where `local` keeps its runtime state (pid + captured app log). Overridable so
-# tests can point it at a throwaway dir. Defaults to the LOCAL data dir.
-STATE_DIR="${DO_LOCAL_STATE_DIR:-$REPO_ROOT/demo/.localdata}"
-PID_FILE="$STATE_DIR/local.pid"
-LOG_FILE="$STATE_DIR/local.log"
+# The app to run/deploy is selected with the global `--app-dir <dir>` flag (F11,
+# #27); its digital-ocean.yml manifest supplies every app-specific fact. Nothing
+# below hardcodes the demo — _load_manifest resolves it all. DO_APP_DIR is an env
+# fallback (handy for a vendored copy that always targets one app).
+APP_DIR_OPT="${DO_APP_DIR:-}"
 
-# The venv `local` builds from demo/requirements.txt (the SAME manifest that
-# ships to DO — proving one dependency set runs in both places, UC7).
+# `local` runtime state (pid + captured app log). DO_LOCAL_STATE_DIR overrides the
+# location (tests point it at a throwaway dir); otherwise it derives from the app
+# dir. STATE_DIR/PID_FILE/LOG_FILE/LOCAL_URL are set by _resolve_local_state /
+# cmd_local, not here — they depend on the chosen app.
+
+# The venv `local` builds from the app's requirements (the SAME set that ships to
+# DO — proving one dependency set runs in both places, UC7).
 VENV="$REPO_ROOT/.venv"
 
-# The demo app binds here under APP_ENV=LOCAL (config.py: 127.0.0.1:5000).
-LOCAL_URL="http://127.0.0.1:5000"
-# Local Ollama endpoint (matches the demo app's OLLAMA_URL default).
+# Local Ollama endpoint (the app's OLLAMA_URL in `local`).
 OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434}"
 
 # Where `setup` (F4) writes the local config. Repo-local and gitignored;
@@ -65,18 +69,23 @@ log_error() { log ERROR "$@"; }
 
 usage() {
 	cat <<EOF
-Usage: digital-ocean [--help] [--verbose] [<command>]
+Usage: digital-ocean [--help] [--verbose] [--app-dir <dir>] [<command>]
 
-Control CLI for the DigitalOcean demo host — provisions/tears down the DO
-infrastructure and runs the reference "demo" app on it.
+Control CLI for DigitalOcean — provisions/tears down the DO infrastructure and
+runs a conforming app on it. The app is chosen with --app-dir <dir>, which must
+hold a digital-ocean.yml manifest (see demo/digital-ocean.yml for the reference).
+
+Global options:
+  --app-dir <dir>  App to run/deploy (dir containing digital-ocean.yml). Required
+                   by 'local' and 'start'. Also settable via \$DO_APP_DIR.
 
 Commands:
   setup            One-time local preflight + interview → write local config.
   setup --non-interactive   Same, no prompts (accept defaults / env overrides).
-  local            Run the demo app on this Mac (venv + Flask + browser).
-  local down       Stop the locally running demo app.
-  start            Provision DO infra + deploy the demo end-to-end (BILLABLE);
-                   prints the public URL and ssh commands when healthy.
+  local            Run the app on this Mac (venv + browser). Needs --app-dir.
+  local down       Stop the locally running app.
+  start            Provision DO infra + deploy the app end-to-end (BILLABLE);
+                   prints the public URL and ssh commands when healthy. Needs --app-dir.
   stop             Tear down the droplets + firewalls; KEEP volumes + VPC so a
                    later 'start' reuses the data (stops billing for compute).
   destroy          Full teardown: droplets + firewalls + volumes + VPC (all data
@@ -93,6 +102,90 @@ With no command, prints a short banner.
 EOF
 }
 
+# --- App manifest (F11, #27) -------------------------------------------------
+# `digital-ocean.yml` (in the app dir) carries the per-app facts the CLI used to
+# hardcode for the demo. `infra/` stays tool-owned. The app dir is chosen with
+# the global `--app-dir <dir>` flag; the manifest lives at <app-dir>/digital-ocean.yml.
+
+# Read one scalar KEY from a flat "key: value" manifest. Comment lines and blanks
+# are ignored; an inline " # comment" after a value is stripped; surrounding
+# single/double quotes are removed; a colon inside the value (e.g. a model tag
+# llama3.2:1b) is preserved because only the FIRST colon is the key separator.
+#
+# Deliberately a minimal flat-YAML reader — no jq/yq (matches this repo's
+# dependency-light ethos). YAGNI: if the manifest ever grows nested maps or lists,
+# replace this with a real YAML parser rather than extending the awk below.
+_manifest_get() { # file key
+	awk -v k="$2" '
+		/^[[:space:]]*#/ { next }                     # comment line
+		{
+			line = $0
+			sub(/[[:space:]]+#.*$/, "", line)         # strip inline trailing comment
+			if (match(line, "^[[:space:]]*" k "[[:space:]]*:")) {
+				val = substr(line, RLENGTH + 1)       # everything after "key:"
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)          # trim
+				if (val ~ /^".*"$/ || val ~ /^'\''.*'\''$/)          # strip matching quotes
+					val = substr(val, 2, length(val) - 2)
+				print val
+				exit
+			}
+		}
+	' "$1"
+}
+
+# Resolve --app-dir and load+validate the manifest into APP_* vars used by
+# `local` and `start`. Sets: APP_CODE_DIR (abs app code root), APP_ENTRYPOINT and
+# APP_REQUIREMENTS_REL (relative to APP_CODE_DIR), APP_PORT, APP_HEALTH_PATH,
+# APP_OLLAMA_MODEL, APP_CREDS_ENV (0|1). Returns 2 (usage) when --app-dir is
+# absent, 1 when the dir/manifest/keys are bad.
+_load_manifest() {
+	if [ -z "$APP_DIR_OPT" ]; then
+		log_error "no app selected — pass --app-dir <dir> (the directory holding digital-ocean.yml)."
+		usage >&2
+		return 2
+	fi
+	if [ ! -d "$APP_DIR_OPT" ]; then
+		log_error "--app-dir '$APP_DIR_OPT' is not a directory."
+		return 1
+	fi
+	APP_DIR_ABS="$(cd "$APP_DIR_OPT" && pwd)"
+	MANIFEST="$APP_DIR_ABS/digital-ocean.yml"
+	if [ ! -f "$MANIFEST" ]; then
+		log_error "no manifest at $MANIFEST — every app needs a digital-ocean.yml (see demo/digital-ocean.yml)."
+		return 1
+	fi
+
+	m_app_dir="$(_manifest_get "$MANIFEST" app_dir)"
+	APP_ENTRYPOINT="$(_manifest_get "$MANIFEST" entrypoint)"
+	APP_REQUIREMENTS_REL="$(_manifest_get "$MANIFEST" requirements)"
+	APP_PORT="$(_manifest_get "$MANIFEST" port)"
+	APP_HEALTH_PATH="$(_manifest_get "$MANIFEST" health_path)"
+	APP_OLLAMA_MODEL="$(_manifest_get "$MANIFEST" ollama_model)"
+	m_creds="$(_manifest_get "$MANIFEST" credentials_env_file)"
+
+	# Every scalar except credentials_env_file (optional) is required.
+	for pair in "app_dir=$m_app_dir" "entrypoint=$APP_ENTRYPOINT" \
+		"requirements=$APP_REQUIREMENTS_REL" "port=$APP_PORT" \
+		"health_path=$APP_HEALTH_PATH" "ollama_model=$APP_OLLAMA_MODEL"; do
+		if [ -z "${pair#*=}" ]; then
+			log_error "manifest $MANIFEST is missing required key: ${pair%%=*}"
+			return 1
+		fi
+	done
+
+	# app_dir is relative to the manifest; entrypoint/requirements are relative to
+	# the resolved app code dir.
+	if ! APP_CODE_DIR="$(cd "$APP_DIR_ABS/$m_app_dir" 2>/dev/null && pwd)"; then
+		log_error "manifest app_dir '$m_app_dir' does not resolve under $APP_DIR_ABS."
+		return 1
+	fi
+
+	case "$m_creds" in
+	1 | true | TRUE | True | yes | on) APP_CREDS_ENV=1 ;;
+	*) APP_CREDS_ENV=0 ;;
+	esac
+}
+
 # --- `digital-ocean local` (F3) ---------------------------------------------
 
 # Reachable if the local Ollama server answers /api/tags. Used as an `if`
@@ -106,11 +199,11 @@ _alive() {
 	[ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null
 }
 
-# Poll the app's /health until it answers 200, up to ~15s.
+# Poll the app's health endpoint until it answers 200, up to ~15s.
 _wait_health() {
 	tries=0
 	while [ "$tries" -lt 30 ]; do
-		if curl -fsS --max-time 1 "$LOCAL_URL/health" >/dev/null 2>&1; then
+		if curl -fsS --max-time 1 "$LOCAL_URL$APP_HEALTH_PATH" >/dev/null 2>&1; then
 			return 0
 		fi
 		sleep 0.5
@@ -130,6 +223,22 @@ _open_browser() {
 	fi
 }
 
+# Resolve the local run-state dir (pid + captured log). DO_LOCAL_STATE_DIR wins
+# (tests); otherwise it lives under the app's own .localdata. Sets STATE_DIR and
+# the derived PID_FILE/LOG_FILE.
+_resolve_local_state() {
+	if [ -n "${DO_LOCAL_STATE_DIR:-}" ]; then
+		STATE_DIR="$DO_LOCAL_STATE_DIR"
+	elif [ -n "${APP_CODE_DIR:-}" ]; then
+		STATE_DIR="$APP_CODE_DIR/.localdata"
+	else
+		log_error "cannot locate local run-state — pass --app-dir (or set DO_LOCAL_STATE_DIR)."
+		return 1
+	fi
+	PID_FILE="$STATE_DIR/local.pid"
+	LOG_FILE="$STATE_DIR/local.log"
+}
+
 cmd_local() {
 	# `local down` is the teardown; everything else must be empty.
 	if [ "${1:-}" = "down" ]; then
@@ -141,6 +250,12 @@ cmd_local() {
 		usage >&2
 		return 2
 	fi
+
+	# Learn the app from its manifest (--app-dir), then locate run-state and the
+	# local URL (bind 127.0.0.1 on the manifest port).
+	_load_manifest || return $?
+	_resolve_local_state || return $?
+	LOCAL_URL="http://127.0.0.1:$APP_PORT"
 
 	# Already running? Re-open the browser rather than starting a second copy.
 	if [ -f "$PID_FILE" ]; then
@@ -163,10 +278,10 @@ cmd_local() {
 		return 1
 	fi
 
-	# Ensure a venv from the SAME demo/requirements.txt that ships to DO.
+	# Ensure a venv from the SAME app requirements that ship to DO.
 	if [ ! -x "$VENV/bin/python" ]; then
 		if ! command -v python3 >/dev/null 2>&1; then
-			log_error "python3 not found — install Python 3 to run the demo app."
+			log_error "python3 not found — install Python 3 to run the app."
 			return 1
 		fi
 		log_info "Creating venv at $VENV"
@@ -175,42 +290,54 @@ cmd_local() {
 			return 1
 		fi
 	fi
-	log_info "Installing demo app dependencies (demo/requirements.txt)"
-	if ! PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV/bin/python" -m pip install -q -r "$REPO_ROOT/demo/requirements.txt"; then
+	log_info "Installing app dependencies ($APP_REQUIREMENTS_REL)"
+	if ! PIP_DISABLE_PIP_VERSION_CHECK=1 "$VENV/bin/python" -m pip install -q -r "$APP_CODE_DIR/$APP_REQUIREMENTS_REL"; then
 		log_error "pip install failed"
 		return 1
 	fi
 
-	# Launch Flask detached with APP_ENV=LOCAL; capture output to the log file
-	# and record the pid so `local down` can stop it.
+	# Launch the app detached with the explicit env contract (F11, #27): bind
+	# 127.0.0.1 on the manifest port, point it at local Ollama + the manifest
+	# model, and keep its data under the run-state dir. Capture output to the log
+	# file and record the pid so `local down` can stop it.
 	mkdir -p "$STATE_DIR"
-	log_info "Starting demo app (APP_ENV=LOCAL) — logs at $LOG_FILE"
-	APP_ENV=LOCAL "$VENV/bin/python" "$REPO_ROOT/demo/app.py" >"$LOG_FILE" 2>&1 &
+	log_info "Starting app '$APP_ENTRYPOINT' on $LOCAL_URL — logs at $LOG_FILE"
+	HOST=127.0.0.1 PORT="$APP_PORT" \
+		OLLAMA_URL="$OLLAMA_URL" OLLAMA_MODEL="$APP_OLLAMA_MODEL" \
+		APP_DATA_DIR="$STATE_DIR" \
+		"$VENV/bin/python" "$APP_CODE_DIR/$APP_ENTRYPOINT" >"$LOG_FILE" 2>&1 &
 	app_pid=$!
 	echo "$app_pid" >"$PID_FILE"
 
-	# Not healthy = not Done. Wait for /health, else tear down and report.
+	# Not healthy = not Done. Wait for the health endpoint, else tear down + report.
 	if ! _wait_health; then
-		log_error "demo app did not become healthy — see $LOG_FILE"
+		log_error "app did not become healthy — see $LOG_FILE"
 		kill "$app_pid" 2>/dev/null || true
 		rm -f "$PID_FILE"
 		return 1
 	fi
 
-	log_info "demo app healthy at $LOCAL_URL (pid $app_pid)"
+	log_info "app healthy at $LOCAL_URL$APP_HEALTH_PATH (pid $app_pid)"
 	_open_browser
 	# stdout carries the URL only (data), per the logging convention.
 	echo "$LOCAL_URL"
 }
 
 cmd_local_down() {
+	# Locate the run-state dir. DO_LOCAL_STATE_DIR alone is enough (no manifest
+	# needed just to stop); otherwise resolve it from --app-dir like `local` did.
+	if [ -z "${DO_LOCAL_STATE_DIR:-}" ]; then
+		_load_manifest || return $?
+	fi
+	_resolve_local_state || return $?
+
 	if [ ! -f "$PID_FILE" ]; then
 		echo "digital-ocean local: not running."
 		return 0
 	fi
 	pid="$(cat "$PID_FILE" 2>/dev/null || true)"
 	if _alive "$pid"; then
-		log_info "Stopping demo app (pid $pid)."
+		log_info "Stopping app (pid $pid)."
 		kill "$pid" 2>/dev/null || true
 		# Give it a moment to exit; escalate if it clings on.
 		tries=0
@@ -325,7 +452,6 @@ cmd_setup() {
 	env_backend="${OLLAMA_BACKEND:-}"
 	env_ollama_cpu="${DO_OLLAMA_CPU_SIZE:-}"
 	env_enable_fw="${DO_ENABLE_FIREWALL:-}"
-	env_model="${OLLAMA_MODEL:-}"
 	env_keyname="${DO_SSH_KEY_NAME:-}"
 	env_creds="${APP_CREDENTIALS_FILE:-}"
 
@@ -392,7 +518,8 @@ cmd_setup() {
 	# DO cloud firewall (#19): optional. Ollama is kept off the public net by the
 	# private-IP bind, so the firewall is defense-in-depth — default off (0).
 	enable_fw="$(_field "$env_enable_fw" "${DO_ENABLE_FIREWALL:-0}" "Enable DO firewall (0|1)")"
-	model="$(_field "$env_model" "${OLLAMA_MODEL:-llama3.2:1b}" "Ollama model")"
+	# NB (#27): OLLAMA_MODEL is a per-app fact and now lives in the app's
+	# digital-ocean.yml manifest — setup no longer asks for or stores it.
 	key_name="$(_field "$env_keyname" "${DO_SSH_KEY_NAME:-$do_key_name}" "DO SSH key name")"
 	creds="$(_field "$env_creds" "${APP_CREDENTIALS_FILE:-$CONFIG_DIR/credentials}" "Local credentials file")"
 
@@ -414,7 +541,6 @@ cmd_setup() {
 		_kv OLLAMA_BACKEND "$backend"
 		_kv DO_OLLAMA_CPU_SIZE "$ollama_cpu"
 		_kv DO_ENABLE_FIREWALL "$enable_fw"
-		_kv OLLAMA_MODEL "$model"
 		_kv DO_SSH_KEY_NAME "$key_name"
 		_kv APP_CREDENTIALS_FILE "$creds"
 	} >"$tmp"
@@ -422,7 +548,7 @@ cmd_setup() {
 	umask "$old_umask"
 
 	log_info "Wrote config to $CONFIG_FILE"
-	log_info "Setup complete. Next: 'digital-ocean start' provisions the demo (billable)."
+	log_info "Setup complete. Next: 'digital-ocean --app-dir <dir> start' deploys your app (billable)."
 	# stdout carries the config path only (data), per the logging convention.
 	echo "$CONFIG_FILE"
 }
@@ -537,6 +663,11 @@ write_state() {
 		# Firewall IDs are set by F7 `start` (empty on a bare F6 provision).
 		_kv DO_CPU_FW_ID "${DO_CPU_FW_ID:-}"
 		_kv DO_GPU_FW_ID "${DO_GPU_FW_ID:-}"
+		# The deployed app's port + health path (F11, #27) — set by `start` from the
+		# manifest, empty on a bare `provision`. F9 status/logs read them from here so
+		# those debug helpers stay manifest-free.
+		_kv APP_PORT "${APP_PORT:-}"
+		_kv APP_HEALTH_PATH "${APP_HEALTH_PATH:-}"
 	} >"$tmp"
 	mv "$tmp" "$DO_STATE_FILE"
 	umask "$old_umask"
@@ -818,11 +949,12 @@ cmd_destroy() {
 }
 
 # --- `digital-ocean start` (F7) ---------------------------------------------
-# The public end-to-end orchestration: provision (reuse F6) → firewalls → wait for
-# SSH → sync code → run F5 provision scripts over SSH → ollama pull → scp creds →
-# deploy the F2 demo app as a systemd unit (APP_ENV=DO_DEMO, private Ollama URL) →
-# health checks → print the public URL + ready-to-paste ssh commands. Idempotent:
-# a re-run adopts every resource, re-syncs, and restarts the service.
+# The public end-to-end orchestration: load the app manifest (--app-dir) →
+# provision (reuse F6) → firewalls → wait for SSH → sync code → run F5 provision
+# scripts over SSH → ollama pull → scp creds → deploy the app as a systemd unit
+# (the explicit manifest env contract, private Ollama URL — F11/#27) → health
+# checks → print the public URL + ready-to-paste ssh commands. Idempotent: a
+# re-run adopts every resource, re-syncs, and restarts the service.
 
 # Where `start` pins droplet host keys (accept-new on first connect, then verify).
 KNOWN_HOSTS="$CONFIG_DIR/known_hosts"
@@ -951,6 +1083,10 @@ cmd_start() {
 		return 2
 	fi
 
+	# 0. Learn the app from its manifest (--app-dir) BEFORE provisioning anything —
+	#    a bad/missing manifest must fail before a single billable resource is made.
+	_load_manifest || return $?
+
 	# 1. Provision (reuse F6). This sets DO_* resource vars in our scope and writes
 	#    .do/state; its stdout (the state path) is data we don't want in start's.
 	if ! cmd_provision >/dev/null; then
@@ -975,7 +1111,7 @@ cmd_start() {
 			return 1
 		fi
 		DO_CPU_FW_ID="$(ensure_firewall "${DO_CPU_NAME}-fw" \
-			"protocol:tcp,ports:5000,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
+			"protocol:tcp,ports:$APP_PORT,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
 		DO_GPU_FW_ID="$(ensure_firewall "${DO_GPU_NAME}-fw" \
 			"protocol:tcp,ports:11434,address:$vpc_range protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
 		assign_firewall "$DO_CPU_FW_ID" "$DO_CPU_DROPLET_ID" || return 1
@@ -990,14 +1126,17 @@ cmd_start() {
 	_wait_ssh "$DO_CPU_PUBLIC_IP" || return 1
 	_wait_ssh "$DO_GPU_PUBLIC_IP" || return 1
 
-	# 4. Sync the app + provisioning scripts to /opt/app on both hosts. A fresh
-	# droplet's sshd can reset or stall the first transfers while cloud-init runs,
-	# so retry each step (all idempotent) rather than fail the whole start.
-	log_info "Syncing demo/ + infra/ to /opt/app on both droplets."
-	_retry 5 _ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
-	_retry 5 _ssh "$DO_GPU_PUBLIC_IP" "mkdir -p /opt/app" || return 1
-	_retry 5 _rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_CPU_PUBLIC_IP:/opt/app/" || return 1
-	_retry 5 _rsync "$REPO_ROOT/demo" "$REPO_ROOT/infra" "root@$DO_GPU_PUBLIC_IP:/opt/app/" || return 1
+	# 4. Sync the app code + provisioning scripts on both hosts (F11, #27): the app
+	# CODE always lands at /opt/app/app (the trailing slash on the source syncs its
+	# contents in, independent of the source dir's name), and the tool-owned infra/
+	# at /opt/app/infra. A fresh droplet's sshd can reset or stall the first
+	# transfers while cloud-init runs, so retry each step (all idempotent).
+	log_info "Syncing the app → /opt/app/app and infra/ → /opt/app on both droplets."
+	for ip in "$DO_CPU_PUBLIC_IP" "$DO_GPU_PUBLIC_IP"; do
+		_retry 5 _ssh "$ip" "mkdir -p /opt/app/app" || return 1
+		_retry 5 _rsync "$APP_CODE_DIR/" "root@$ip:/opt/app/app/" || return 1
+		_retry 5 _rsync "$REPO_ROOT/infra" "root@$ip:/opt/app/" || return 1
+	done
 
 	# 5. Ollama node: provision (F5), then pull the model (C8 — persists on
 	# /mnt/models). Bind Ollama to the node's PRIVATE VPC IP (#19) so :11434 is off
@@ -1006,23 +1145,29 @@ cmd_start() {
 	# the same private host — the CLI otherwise defaults to loopback.
 	ollama_bind="$DO_GPU_PRIVATE_IP:11434"
 	if [ "$OLLAMA_BACKEND" = gpu ]; then
-		log_info "Provisioning GPU Ollama node + pulling model '$OLLAMA_MODEL'."
+		log_info "Provisioning GPU Ollama node + pulling model '$APP_OLLAMA_MODEL'."
 		_ssh "$DO_GPU_PUBLIC_IP" \
 			"MODELS_VOLUME_NAME=$DO_MODELS_VOLUME_NAME OLLAMA_HOST=$ollama_bind bash /opt/app/infra/provision-gpu.sh" || return 1
 	else
-		log_info "Provisioning CPU Ollama node + pulling model '$OLLAMA_MODEL'."
+		log_info "Provisioning CPU Ollama node + pulling model '$APP_OLLAMA_MODEL'."
 		_ssh "$DO_GPU_PUBLIC_IP" \
 			"MODELS_VOLUME_NAME=$DO_MODELS_VOLUME_NAME OLLAMA_HOST=$ollama_bind bash /opt/app/infra/provision-ollama-cpu.sh" || return 1
 	fi
-	_ssh "$DO_GPU_PUBLIC_IP" "OLLAMA_HOST=$ollama_bind ollama pull $OLLAMA_MODEL" || return 1
+	_ssh "$DO_GPU_PUBLIC_IP" "OLLAMA_HOST=$ollama_bind ollama pull $APP_OLLAMA_MODEL" || return 1
 
-	# 6. CPU: provision (F5), copy creds (C9/ADR-0005), deploy the app (C10) as a
-	#    systemd unit wired to the GPU's PRIVATE Ollama URL (ADR-0007).
-	log_info "Provisioning CPU droplet + deploying the demo app."
+	# 6. CPU: provision (F5) with the manifest's requirements at the app's
+	#    /opt/app/app location, (optionally) copy creds (C9/ADR-0005), then deploy
+	#    the app (C10) as a systemd unit wired to the GPU's PRIVATE Ollama URL (ADR-0007).
+	log_info "Provisioning CPU droplet + deploying the app."
 	_ssh "$DO_CPU_PUBLIC_IP" \
-		"DATA_VOLUME_NAME=$DO_DATA_VOLUME_NAME bash /opt/app/infra/provision-cpu.sh" || return 1
-	_ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /etc/app" || return 1
-	_scp "$APP_CREDENTIALS_FILE" "root@$DO_CPU_PUBLIC_IP:/etc/app/credentials" || return 1
+		"DATA_VOLUME_NAME=$DO_DATA_VOLUME_NAME REQUIREMENTS_FILE=/opt/app/app/$APP_REQUIREMENTS_REL bash /opt/app/infra/provision-cpu.sh" || return 1
+	# Credentials channel (ADR-0005) is opt-in per the manifest (credentials_env_file).
+	# When on, ship the local creds file to /etc/app/credentials; the systemd unit
+	# loads it as an EnvironmentFile (see _deploy_app).
+	if [ "$APP_CREDS_ENV" = 1 ]; then
+		_ssh "$DO_CPU_PUBLIC_IP" "mkdir -p /etc/app" || return 1
+		_scp "$APP_CREDENTIALS_FILE" "root@$DO_CPU_PUBLIC_IP:/etc/app/credentials" || return 1
+	fi
 	_deploy_app "$DO_CPU_PUBLIC_IP" "$DO_GPU_PRIVATE_IP" || return 1
 
 	# 7. Health checks (C11): Ollama reachable over the PRIVATE IP from the CPU,
@@ -1033,42 +1178,50 @@ cmd_start() {
 		return 1
 	fi
 	if ! _wait_app_health "$DO_CPU_PUBLIC_IP"; then
-		log_error "demo app health check never passed on $DO_CPU_PUBLIC_IP:5000"
+		log_error "app health check never passed on $DO_CPU_PUBLIC_IP:$APP_PORT$APP_HEALTH_PATH"
 		return 1
 	fi
 
-	log_info "Demo is up."
+	log_info "App is up."
 	# stdout carries the public URL + ready-to-paste ssh commands (data; ADR-0006).
-	echo "http://$DO_CPU_PUBLIC_IP:5000"
+	echo "http://$DO_CPU_PUBLIC_IP:$APP_PORT"
 	echo "ssh root@$DO_CPU_PUBLIC_IP   # CPU droplet (app)"
 	echo "ssh root@$DO_GPU_PUBLIC_IP   # GPU droplet (Ollama)"
 }
 
-# Write + enable the demo app's systemd unit on the CPU, wired to the GPU's private
-# Ollama URL. Kept a single ssh command (printf '%b' expands the \n escapes) so the
-# whole unit ships in one round-trip and logs on one line.
+# Write + enable the app's systemd unit on the CPU, wired to the GPU's private
+# Ollama URL. The env is the explicit manifest contract (F11, #27) — HOST/PORT,
+# the private Ollama URL + model, and the data dir — set directly, with NO
+# app-specific APP_ENV. When credentials_env_file is on, systemd loads
+# /etc/app/credentials as an EnvironmentFile (the `-` tolerates it being empty or
+# absent), which is how per-app secrets (e.g. a third-party API key) reach the
+# app. Kept a single ssh command (printf '%b' expands the \n escapes) so the whole
+# unit ships in one round-trip and logs on one line.
 _deploy_app() { # cpu-ip gpu-private-ip
 	unit='[Unit]\n'
-	unit="${unit}Description=hello-digital-ocean demo app\n"
+	unit="${unit}Description=hello-digital-ocean app ($APP_ENTRYPOINT)\n"
 	unit="${unit}After=network-online.target\n\n"
 	unit="${unit}[Service]\n"
-	unit="${unit}Environment=APP_ENV=DO_DEMO\n"
+	unit="${unit}Environment=HOST=0.0.0.0\n"
+	unit="${unit}Environment=PORT=$APP_PORT\n"
 	unit="${unit}Environment=OLLAMA_URL=http://$2:11434\n"
-	unit="${unit}Environment=OLLAMA_MODEL=$OLLAMA_MODEL\n"
+	unit="${unit}Environment=OLLAMA_MODEL=$APP_OLLAMA_MODEL\n"
 	unit="${unit}Environment=APP_DATA_DIR=/mnt/data\n"
-	unit="${unit}Environment=APP_CREDENTIALS_FILE=/etc/app/credentials\n"
-	unit="${unit}ExecStart=/opt/app/.venv/bin/python /opt/app/demo/app.py\n"
+	if [ "$APP_CREDS_ENV" = 1 ]; then
+		unit="${unit}EnvironmentFile=-/etc/app/credentials\n"
+	fi
+	unit="${unit}ExecStart=/opt/app/.venv/bin/python /opt/app/app/$APP_ENTRYPOINT\n"
 	unit="${unit}Restart=on-failure\n\n"
 	unit="${unit}[Install]\n"
 	unit="${unit}WantedBy=multi-user.target\n"
 	_ssh "$1" "printf '%b' '$unit' >/etc/systemd/system/app.service; systemctl daemon-reload; systemctl enable app.service; systemctl restart app.service"
 }
 
-# Poll the app's /health from inside the CPU droplet up to DO_HEALTH_WAIT_SECS.
+# Poll the app's health endpoint from inside the CPU droplet up to DO_HEALTH_WAIT_SECS.
 _wait_app_health() { # cpu-ip
 	waited=0
 	while true; do
-		if _ssh "$1" "curl -fsS --max-time 5 http://127.0.0.1:5000/health >/dev/null" 2>/dev/null; then
+		if _ssh "$1" "curl -fsS --max-time 5 http://127.0.0.1:$APP_PORT$APP_HEALTH_PATH >/dev/null" 2>/dev/null; then
 			return 0
 		fi
 		if [ "$waited" -ge "$DO_HEALTH_WAIT_SECS" ]; then
@@ -1097,13 +1250,15 @@ _load_state_or_die() {
 }
 
 # Resolve a role (cpu|gpu, default cpu) to "PUBLIC_IP UNIT HEALTH_URL".
-# cpu → the demo app (app.service, :5000/health);
+# cpu → the app (app.service, :<APP_PORT><APP_HEALTH_PATH> from .do/state);
 # gpu → the Ollama node (ollama.service, :11434/api/tags).
 # Unknown role → exit 2 (usage error); empty/missing IP → exit 1.
 _resolve_target() { # role
 	role="${1:-cpu}"
+	# The app port + health path come from .do/state (recorded by `start` from the
+	# manifest, F11/#27); the fallback covers a bare `provision` with no app deployed.
 	case "$role" in
-	cpu) ip="${DO_CPU_PUBLIC_IP:-}"; unit="app.service"; health="http://127.0.0.1:5000/health" ;;
+	cpu) ip="${DO_CPU_PUBLIC_IP:-}"; unit="app.service"; health="http://127.0.0.1:${APP_PORT:-5000}${APP_HEALTH_PATH:-/health}" ;;
 	gpu) ip="${DO_GPU_PUBLIC_IP:-}"; unit="ollama.service"; health="http://127.0.0.1:11434/api/tags" ;;
 	*)
 		log_error "unknown target '$role' (expected: cpu | gpu)"
@@ -1223,6 +1378,21 @@ main() {
 			;;
 		-v | --verbose)
 			LOG_LEVEL=DEBUG
+			shift
+			;;
+		--app-dir)
+			# Global option (F11, #27): select the app to run/deploy. Its
+			# digital-ocean.yml manifest supplies the app-specific facts.
+			if [ $# -lt 2 ]; then
+				log_error "--app-dir requires a directory argument"
+				usage >&2
+				return 2
+			fi
+			APP_DIR_OPT="$2"
+			shift 2
+			;;
+		--app-dir=*)
+			APP_DIR_OPT="${1#--app-dir=}"
 			shift
 			;;
 		--)

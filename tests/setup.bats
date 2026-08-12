@@ -69,7 +69,10 @@ EOF
 	grep -q "DO_REGION='blr1'" "$CONFIG_DIR/config"
 	grep -q "DO_CPU_SIZE='s-2vcpu-4gb'" "$CONFIG_DIR/config"
 	grep -q "DO_GPU_SIZE='gpu-6000adax1-48gb'" "$CONFIG_DIR/config"
-	grep -q "OLLAMA_MODEL='llama3.2:1b'" "$CONFIG_DIR/config"
+	# #27 (F11): OLLAMA_MODEL is a per-app fact — it now lives in the app's
+	# digital-ocean.yml manifest, NOT the infra config. setup must not write it.
+	# (count form, not `! grep`: a mid-test `!`-pipeline failure is silently ignored.)
+	[ "$(grep -c "OLLAMA_MODEL" "$CONFIG_DIR/config")" -eq 0 ]
 	# #18/#19: selectable backend (default cpu), CPU Ollama node size, optional firewall.
 	grep -q "OLLAMA_BACKEND='cpu'" "$CONFIG_DIR/config"
 	grep -q "DO_OLLAMA_CPU_SIZE='s-8vcpu-16gb-amd'" "$CONFIG_DIR/config"
@@ -151,14 +154,15 @@ EOF
 }
 
 @test "a prior config value becomes the default on re-run" {
-	# Region is now a pure function of backend (#17), so use a field that is
-	# seeded from stored config to exercise "prior value persists".
-	OLLAMA_MODEL=llama3.1:8b run $DO setup --non-interactive
+	# Region is now a pure function of backend (#17), and OLLAMA_MODEL moved to the
+	# manifest (#27), so exercise "prior value persists" with DO_CPU_SIZE — a field
+	# still seeded from stored config.
+	DO_CPU_SIZE=s-4vcpu-8gb run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	# Second run without the override should preserve the stored value.
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
-	grep -q "OLLAMA_MODEL='llama3.1:8b'" "$CONFIG_DIR/config"
+	grep -q "DO_CPU_SIZE='s-4vcpu-8gb'" "$CONFIG_DIR/config"
 }
 
 @test "a value with a single quote round-trips (config stays sourceable)" {

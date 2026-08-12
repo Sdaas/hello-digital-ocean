@@ -13,7 +13,7 @@ state lives only on the volumes (ADR 0001/0002).
 
 | Script | Runs on | What it does |
 |---|---|---|
-| `provision-cpu.sh` | CPU droplet | apt `python3`/`venv`/`pip` → mount the **data** volume at `/mnt/data` → create the log dir → build the venv and `pip install -r demo/requirements.txt`. |
+| `provision-cpu.sh` | CPU droplet | apt `python3`/`venv`/`pip` → mount the **data** volume at `/mnt/data` → create the log dir → build the venv and `pip install -r` the app's requirements (the CLI passes `/opt/app/app/<requirements>` from the manifest — F11, #27). |
 | `provision-gpu.sh` | GPU droplet | **assert** the NVIDIA driver (`nvidia-smi`) → mount the **models** volume at `/mnt/models` → install Ollama → point it at the volume + VPC via a systemd drop-in. |
 
 Both are **idempotent** (re-running skips completed work) and safe to re-run
@@ -39,7 +39,7 @@ list. The most relevant:
 | Var | Default | Meaning |
 |---|---|---|
 | `APP_DIR` | `/opt/app` | where F7 places the app |
-| `REQUIREMENTS_FILE` | `$APP_DIR/demo/requirements.txt` | `pip install -r` target |
+| `REQUIREMENTS_FILE` | `$APP_DIR/app/requirements.txt` | `pip install -r` target |
 | `DATA_MOUNT` | `/mnt/data` | data volume mountpoint (+ `$DATA_MOUNT/logs`) |
 | `DATA_VOLUME_NAME` | *(unset)* | DO volume name → derives the block device |
 | `DATA_DEVICE` | derived from `DATA_VOLUME_NAME` | block device to format-if-empty + mount |

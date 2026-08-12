@@ -1,0 +1,17 @@
+# digital-ocean.yml — deploy manifest for the reference "demo" app (F11, #27).
+#
+# The `digital-ocean` CLI reads this file (via `--app-dir demo`) to learn the
+# app's facts, instead of hardcoding them. Any conforming app ships its own
+# copy of this manifest in its app dir. `infra/` stays tool-owned.
+#
+# Flat "key: value" only — the CLI parses this with a minimal pure-shell reader
+# (no jq/yq). Keep it flat; if it ever needs nested maps/lists, the CLI note in
+# bin/digital-ocean (_manifest_get) calls for switching to a real YAML parser.
+
+app_dir: .                 # app code root, relative to THIS manifest (rsynced to /opt/app/app)
+entrypoint: app.py         # python entrypoint, relative to app_dir
+requirements: requirements.txt   # pip -r target, relative to app_dir
+port: 5000                 # port the app binds/serves on
+health_path: /health       # readiness endpoint (must report app + Ollama health)
+ollama_model: llama3.2:1b  # model the app needs (pulled on the Ollama node)
+credentials_env_file: true # ship /etc/app/credentials as a systemd EnvironmentFile

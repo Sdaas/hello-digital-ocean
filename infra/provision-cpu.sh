@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# provision-cpu.sh — provision a fresh Ubuntu CPU droplet for the demo app (F5).
+# provision-cpu.sh — provision a fresh Ubuntu CPU droplet for the app (F5).
 #
 # Runs as root ON THE DROPLET, invoked over SSH by the `digital-ocean` CLI
 # (F7) after each `start` — droplets are ephemeral (ADR-0001), so this reinstalls
@@ -14,7 +14,8 @@
 #      stop→start, ADR-0003), then mount it and record it in /etc/fstab using
 #      DigitalOcean's recommended device-path line.
 #   3. Create the log dir on the data volume (ADR-0003).
-#   4. Build the Python venv and install $REQUIREMENTS_FILE (demo/requirements.txt).
+#   4. Build the Python venv and install $REQUIREMENTS_FILE (the app's requirements;
+#      the CLI passes /opt/app/app/<requirements> from the manifest — F11, #27).
 #
 # It does NOT deploy the app or copy credentials — that is F7. Configuration is
 # via environment variables (see below); F7 exports them over SSH.
@@ -22,7 +23,7 @@
 #   Env var            Default                              Meaning
 #   APP_DIR            /opt/app                             where F7 puts the app
 #   VENV_DIR           $APP_DIR/.venv                       Python venv location
-#   REQUIREMENTS_FILE  $APP_DIR/demo/requirements.txt       pip -r target
+#   REQUIREMENTS_FILE  $APP_DIR/app/requirements.txt         pip -r target
 #   DATA_MOUNT         /mnt/data                            data volume mountpoint
 #   DATA_VOLUME_NAME   (unset)                              DO volume name → device
 #   DATA_DEVICE        by-id path from DATA_VOLUME_NAME     block device to mount
@@ -34,7 +35,7 @@ set -euo pipefail
 # --- config (env override > default) ----------------------------------------
 APP_DIR="${APP_DIR:-/opt/app}"
 VENV_DIR="${VENV_DIR:-$APP_DIR/.venv}"
-REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-$APP_DIR/demo/requirements.txt}"
+REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-$APP_DIR/app/requirements.txt}"
 DATA_MOUNT="${DATA_MOUNT:-/mnt/data}"
 DATA_VOLUME_NAME="${DATA_VOLUME_NAME:-}"
 DATA_DEVICE="${DATA_DEVICE:-${DATA_VOLUME_NAME:+/dev/disk/by-id/scsi-0DO_Volume_$DATA_VOLUME_NAME}}"
@@ -56,7 +57,7 @@ usage() {
 	cat <<EOF
 Usage: provision-cpu.sh [--help] [--verbose]
 
-Provision a fresh Ubuntu CPU droplet for the demo app: apt python deps, mount
+Provision a fresh Ubuntu CPU droplet for the app: apt python deps, mount
 the data volume at \$DATA_MOUNT (${DATA_MOUNT}), create the log dir, and build
 the venv from \$REQUIREMENTS_FILE. Idempotent; run as root over SSH (F7).
 Configured by environment variables — see the header of this script.

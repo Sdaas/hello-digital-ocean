@@ -22,8 +22,8 @@ setup() {
 	export APP_DIR="$BATS_TEST_TMPDIR/opt/app"
 	export DATA_MOUNT="$BATS_TEST_TMPDIR/mnt/data"
 	export FSTAB_FILE="$BATS_TEST_TMPDIR/fstab"
-	export REQUIREMENTS_FILE="$APP_DIR/demo/requirements.txt"
-	mkdir -p "$APP_DIR/demo"
+	export REQUIREMENTS_FILE="$APP_DIR/app/requirements.txt"
+	mkdir -p "$APP_DIR/app"
 	: >"$REQUIREMENTS_FILE"
 	: >"$FSTAB_FILE"
 
