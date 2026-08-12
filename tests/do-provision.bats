@@ -83,7 +83,7 @@ _shim_doctl() {
 	cat >"$SHIM/doctl" <<'EOF'
 #!/usr/bin/env bash
 REG="${DOCTL_REG:?}"; RES="$REG/resources"; ATT="$REG/attach"; CALLS="$REG/calls"
-: >>"$RES"; : >>"$ATT"; : >>"$CALLS"
+: >>"$RES"; : >>"$ATT"; : >>"$CALLS"; : >>"$REG/assign"
 printf '%s\n' "$*" >>"$CALLS"
 
 # Real doctl's `vpcs create` does NOT support --format (unlike volume/droplet
@@ -183,6 +183,28 @@ case "$key" in
 	# Real doctl PADS the Name column with trailing spaces to align it — emulate
 	# that (regression for _resolve_ssh_key stripping the pad; found at #18 VERIFY).
 	printf '%-28s %s\n' "${DOCTL_KEY_NAME:-my-mac}" "111";;
+"projects list")
+	# `projects list --format ID,Name --no-header` : ID then Name (adopt-by-name).
+	awk '$1=="project"{print $3, $2}' "$RES";;
+"projects create")
+	# DOCTL_PROJECTS_DENY=1 simulates a token without projects scope (like #16's
+	# missing firewall scope) so the best-effort path can be tested.
+	if [ "${DOCTL_PROJECTS_DENY:-0}" = "1" ]; then
+		echo "Error: forbidden (projects scope)" >&2; exit 1
+	fi
+	# create --name <n> --purpose ... --environment ... --format ID --no-header
+	id="$(_id "$name")"; [ -n "$(_find_id project "$name")" ] || _add project "$name" "$id" - -
+	printf '%s\n' "$id";;
+"projects resources")
+	# `projects resources assign <proj-id> --resource <urn> ...`. The arg loop above
+	# already split argv, so the URNs live in args[] (interleaved with --resource).
+	# Record "PROJID URN" pairs so tests can assert exactly what was assigned.
+	if [ "${args[2]:-}" = assign ]; then
+		pid="${args[3]:-}"
+		for u in "${args[@]}"; do
+			case "$u" in do:*) printf '%s %s\n' "$pid" "$u" >>"$REG/assign";; esac
+		done
+	fi;;
 "account get") exit 0;;
 esac
 exit 0
@@ -246,6 +268,56 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$status" -eq 0 ]
 	printf '%s' "$output" | grep -qi "DO_REGION overrides manifest"
 	grep -q "DO_VPC_ID='id-demo-prod-vpc-tor1'" "$CONFIG_DIR/state.prod"
+}
+
+@test "#30: provision creates the <name>-<env> DO Project and records it in state" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	# A project named demo-prod was created and its id recorded.
+	grep -q "^project demo-prod " "$REG/resources"
+	grep -q "DO_PROJECT_NAME='demo-prod'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_PROJECT_ID='id-demo-prod'" "$CONFIG_DIR/state.prod"
+}
+
+@test "#30: provision assigns both droplets and both volumes to the project" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	# All four resource URNs assigned to the demo-prod project id.
+	grep -q "id-demo-prod do:droplet:id-demo-prod-backend" "$REG/assign"
+	grep -q "id-demo-prod do:droplet:id-demo-prod-ollama-cpu" "$REG/assign"
+	grep -q "id-demo-prod do:volume:id-demo-prod-data" "$REG/assign"
+	grep -q "id-demo-prod do:volume:id-demo-prod-models" "$REG/assign"
+}
+
+@test "#30: --env staging groups under a demo-staging project" {
+	run $DO --env staging provision
+	[ "$status" -eq 0 ]
+	grep -q "^project demo-staging " "$REG/resources"
+	grep -q "DO_PROJECT_NAME='demo-staging'" "$CONFIG_DIR/state.staging"
+	grep -q "id-demo-staging do:droplet:id-demo-staging-backend" "$REG/assign"
+}
+
+@test "#30: re-running provision adopts the project — no second create" {
+	run $DO provision
+	[ "$status" -eq 0 ]
+	: >"$REG/calls"
+	run $DO provision
+	[ "$status" -eq 0 ]
+	# Still exactly one project, and the second run issued no `projects create`.
+	[ "$(_count project)" -eq 1 ]
+	run grep -E "projects create" "$REG/calls"
+	[ "$status" -ne 0 ]
+}
+
+@test "#30: project grouping is best-effort — a scopeless token still deploys" {
+	# Token lacks projects scope: create is denied. Provision must still succeed
+	# (resources created), with a warning, and no project id in state.
+	DOCTL_PROJECTS_DENY=1 run $DO provision
+	[ "$status" -eq 0 ]
+	[ "$(_count droplet)" -eq 2 ]
+	[ "$(_count volume)" -eq 2 ]
+	printf '%s' "$output" | grep -qi "project"
+	grep -q "DO_PROJECT_ID=''" "$CONFIG_DIR/state.prod"
 }
 
 @test "provision requires --app-dir/manifest (fails without one)" {

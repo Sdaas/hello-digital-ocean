@@ -688,6 +688,61 @@ attach_volume() { # vol-id droplet-id
 	fi
 }
 
+# Map the deployment env to DigitalOcean's Project `environment` enum (F13, #30).
+_do_project_environment() {
+	case "$DEPLOY_ENV" in
+	prod) printf 'Production' ;;
+	staging) printf 'Staging' ;;
+	*) printf 'Development' ;;
+	esac
+}
+
+# Ensure a DO Project named $1 exists (adopt-by-name, else create). Echoes its ID,
+# or nothing on failure. Projects group resources in the DO console/billing (#30);
+# create needs a purpose (required by doctl) + the env-mapped `environment` badge.
+ensure_project() { # name
+	id="$(doctl projects list --format ID,Name --no-header 2>/dev/null | awk -v n="$1" '$2==n{print $1; exit}')"
+	if [ -n "$id" ]; then
+		log_info "project $1: adopting existing ($id)"
+	else
+		log_info "project $1: creating"
+		id="$(doctl projects create --name "$1" \
+			--purpose 'Provisioned by the digital-ocean CLI' \
+			--environment "$(_do_project_environment)" \
+			--format ID --no-header 2>/dev/null)" || return 1
+	fi
+	printf '%s' "$id"
+}
+
+# Group the provisioned droplets + volumes under the per-app/env DO Project (#30).
+# BEST-EFFORT: a token without `project` scope (cf. #16's missing firewall scope)
+# must NOT fail an already-billable provision — the resources still work in the
+# default project, so a failure here only warns. Assigns one resource per call
+# (zsh has no word-splitting, so a single multi-flag string wouldn't expand).
+_group_into_project() {
+	pid="$(ensure_project "$_name_prefix")" || pid=""
+	if [ -z "$pid" ]; then
+		log_error "could not create/adopt DO Project '$_name_prefix' — leaving resources in the default project (token may lack 'project' scope). Continuing."
+		return 0
+	fi
+	DO_PROJECT_ID="$pid"
+	DO_PROJECT_NAME="$_name_prefix"
+	write_state
+	_assign_ok=1
+	for urn in \
+		"do:droplet:$DO_CPU_DROPLET_ID" \
+		"do:droplet:$DO_GPU_DROPLET_ID" \
+		"do:volume:$DO_DATA_VOLUME_ID" \
+		"do:volume:$DO_MODELS_VOLUME_ID"; do
+		doctl projects resources assign "$pid" --resource "$urn" >/dev/null 2>&1 || _assign_ok=0
+	done
+	if [ "$_assign_ok" = 1 ]; then
+		log_info "assigned droplets + volumes to project '$DO_PROJECT_NAME' ($pid)"
+	else
+		log_error "some resources could not be assigned to project '$DO_PROJECT_NAME' — they remain in the default project. Continuing."
+	fi
+}
+
 # Rewrite .do/state from the current DO_* vars (atomic, private perms). Called
 # after each ensure step so state never claims a resource that wasn't made.
 write_state() {
@@ -697,6 +752,10 @@ write_state() {
 	tmp="$DO_STATE_FILE.tmp.$$"
 	{
 		printf '# digital-ocean state — written by "digital-ocean provision" (F6). Gitignored; do not commit.\n'
+		# The DO Project the resources are grouped under (F13, #30). Empty on a bare
+		# provision that predates project grouping, or when the token lacks project scope.
+		_kv DO_PROJECT_ID "${DO_PROJECT_ID:-}"
+		_kv DO_PROJECT_NAME "${DO_PROJECT_NAME:-}"
 		_kv DO_VPC_ID "${DO_VPC_ID:-}"
 		_kv DO_VPC_NAME "${DO_VPC_NAME:-}"
 		_kv DO_DATA_VOLUME_ID "${DO_DATA_VOLUME_ID:-}"
@@ -859,6 +918,10 @@ cmd_provision() {
 	attach_volume "$DO_DATA_VOLUME_ID" "$DO_CPU_DROPLET_ID"
 	attach_volume "$DO_MODELS_VOLUME_ID" "$DO_GPU_DROPLET_ID"
 	write_state
+
+	# Group everything under the per-app/env DO Project (F13, #30). Best-effort:
+	# never fails the (already-billable) provision — see _group_into_project.
+	_group_into_project
 
 	log_info "Provisioned. CPU $DO_CPU_PUBLIC_IP (private $DO_CPU_PRIVATE_IP), GPU $DO_GPU_PUBLIC_IP (private $DO_GPU_PRIVATE_IP)."
 	log_info "State recorded at $DO_STATE_FILE"
@@ -1443,6 +1506,10 @@ cmd_status() {
 		return 2
 	fi
 	_load_state_or_die || return 1
+	# Note the DO Project the resources are grouped under (F13, #30), when recorded.
+	if [ -n "${DO_PROJECT_NAME:-}" ]; then
+		log_info "resources grouped under DO Project '$DO_PROJECT_NAME'"
+	fi
 	if [ -n "$role" ]; then
 		_status_one "$role"
 	else

@@ -267,6 +267,22 @@ This file remains the home for design notes that emerge during per-feature
   (`_manifest_get_deployment`) — still no `jq`/`yq` (the F11 YAGNI note anticipated
   this). No backward-compat (no live deploys predate this). Verified with `demo/`
   (`name: demo`, `prod`/`staging` deployments); live VERIFY `--app-dir demo --env prod`.
+- **DO Project grouping (F13, #30):** provisioned resources are grouped under a DO
+  **Project** named `<name>-<env>` (e.g. `demo-prod`) instead of the account default
+  "first-project", so the console and billing views are organized per app/env.
+  `ensure_project` adopts-by-name or creates (`--purpose` + an env-mapped
+  `--environment` badge: prod→Production, staging→Staging), then the droplets +
+  volumes are assigned by URN (`do:droplet:<id>` / `do:volume:<id>`; **VPCs aren't
+  project resources**). Runs at the end of `provision` (which `start` calls); the
+  project id/name land in `.do/state.<env>`; `status` notes the project. Key
+  decisions: (1) **best-effort** — a token lacking `project` scope (cf. #16's
+  firewall scope) only **warns**, never fails an already-billable `provision`
+  (grouping is cosmetic, resources still work in the default project); (2) `destroy`
+  **leaves the emptied project** in place (Projects are free); (3) resources are
+  assigned **one per call** (zsh has no word-splitting, so a single multi-`--resource`
+  string wouldn't expand). The `doctl projects` boundary is PATH-stubbed in the fast
+  lane, obligating the opt-in real-`doctl` project create/assign test in
+  `tests/integration/do-provision.bats` + the batched live VERIFY.
 
 ## Constraints
 
