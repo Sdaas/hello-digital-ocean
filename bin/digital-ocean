@@ -26,6 +26,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # fallback (handy for a vendored copy that always targets one app).
 APP_DIR_OPT="${DO_APP_DIR:-}"
 
+# Deployment environment (F12, #29): `prod` (default) or `staging`, chosen with the
+# global `--env` flag. It selects the manifest's `deployments.<env>` infra block AND
+# the per-env run-state file (.do/state.<env>), and is the `<env>` token in every DO
+# resource name (`<name>-<env>-…`). DO_ENV is an env fallback (handy for a vendored
+# copy pinned to one env); --env overrides it. Validated in main().
+DEPLOY_ENV="${DO_ENV:-prod}"
+
 # `local` runtime state (pid + captured app log). DO_LOCAL_STATE_DIR overrides the
 # location (tests point it at a throwaway dir); otherwise it derives from the app
 # dir. STATE_DIR/PID_FILE/LOG_FILE/LOCAL_URL are set by _resolve_local_state /
@@ -45,8 +52,11 @@ CONFIG_DIR="${DO_CONFIG_DIR:-$REPO_ROOT/.do}"
 CONFIG_FILE="$CONFIG_DIR/config"
 # Where `provision` (F6) records the DO resource state (VPC, volume,
 # droplet IDs + IPs). Same dir/discipline as the config: repo-local, gitignored,
-# written 0600, sourceable env-style KEY=value. F7/F8/F9 read this file.
-DO_STATE_FILE="$CONFIG_DIR/state"
+# written 0600, sourceable env-style KEY=value. F7/F8/F9 read this file. PER-ENV
+# (F12, #29): `.do/state.<env>` so prod and staging never clobber each other's IDs.
+# Re-derived in main() after --env is parsed (DEPLOY_ENV may change there).
+_resolve_state_file() { DO_STATE_FILE="$CONFIG_DIR/state.$DEPLOY_ENV"; }
+_resolve_state_file
 
 # --- Logging (see design/overview.md) ---------------------------------------
 # Leveled logging to STDERR so stdout carries only real output/data. Two levels
@@ -69,7 +79,7 @@ log_error() { log ERROR "$@"; }
 
 usage() {
 	cat <<EOF
-Usage: digital-ocean [--help] [--verbose] [--app-dir <dir>] [<command>]
+Usage: digital-ocean [--help] [--verbose] [--app-dir <dir>] [--env <env>] [<command>]
 
 Control CLI for DigitalOcean — provisions/tears down the DO infrastructure and
 runs a conforming app on it. The app is chosen with --app-dir <dir>, which must
@@ -77,7 +87,10 @@ hold a digital-ocean.yml manifest (see demo/digital-ocean.yml for the reference)
 
 Global options:
   --app-dir <dir>  App to run/deploy (dir containing digital-ocean.yml). Required
-                   by 'local' and 'start'. Also settable via \$DO_APP_DIR.
+                   by 'local', 'start' and 'provision'. Also settable via \$DO_APP_DIR.
+  --env <env>      Deployment environment: prod (default) or staging. Selects the
+                   manifest deployments.<env> infra block, the .do/state.<env> file,
+                   and the <env> token in resource names. Also settable via \$DO_ENV.
 
 Commands:
   setup            One-time local preflight + interview → write local config.
@@ -133,6 +146,52 @@ _manifest_get() { # file key
 	' "$1"
 }
 
+# Read one scalar KEY from the `deployments: <env>:` block of the manifest (F12,
+# #29). This is the minimal 2-LEVEL companion to _manifest_get above — the F11
+# note anticipated exactly this growth. Structure is tracked by state, not fixed
+# indentation depth (portable — no awk interval `{n}` regexes): a top-level line
+# (re)sets context; a `deployments:` top-level line opens the block; an indented
+# header "  <name>:" (a colon with NO value) selects the environment; an indented
+# "    key: value" under the selected environment yields the value. Quotes and
+# inline comments are handled exactly like the flat reader.
+_manifest_get_deployment() { # file env key
+	awk -v env="$2" -v k="$3" '
+		/^[[:space:]]*#/ { next }                          # comment line
+		{
+			line = $0
+			sub(/[[:space:]]+#.*$/, "", line)              # strip inline trailing comment
+			if (line ~ /^[[:space:]]*$/) next              # blank
+
+			if (line ~ /^[^[:space:]]/) {                  # top-level key: (re)set context
+				in_deploy = (line ~ /^deployments[[:space:]]*:/)
+				in_env = 0
+				next
+			}
+			if (!in_deploy) next
+
+			# An indented header "  <name>:" (colon, no value) selects the env.
+			if (line ~ /^[[:space:]]+[^:[:space:]][^:]*:[[:space:]]*$/) {
+				envname = line
+				sub(/^[[:space:]]+/, "", envname)
+				sub(/[[:space:]]*:[[:space:]]*$/, "", envname)
+				in_env = (envname == env)
+				next
+			}
+			if (!in_env) next
+
+			# An indented "    key: value" under the selected env.
+			if (match(line, "^[[:space:]]+" k "[[:space:]]*:")) {
+				val = substr(line, RLENGTH + 1)
+				gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+				if (val ~ /^".*"$/ || val ~ /^'\''.*'\''$/)
+					val = substr(val, 2, length(val) - 2)
+				print val
+				exit
+			}
+		}
+	' "$1"
+}
+
 # Resolve --app-dir and load+validate the manifest into APP_* vars used by
 # `local` and `start`. Sets: APP_CODE_DIR (abs app code root), APP_ENTRYPOINT and
 # APP_REQUIREMENTS_REL (relative to APP_CODE_DIR), APP_PORT, APP_HEALTH_PATH,
@@ -155,6 +214,7 @@ _load_manifest() {
 		return 1
 	fi
 
+	APP_NAME="$(_manifest_get "$MANIFEST" name)"
 	m_app_dir="$(_manifest_get "$MANIFEST" app_dir)"
 	APP_ENTRYPOINT="$(_manifest_get "$MANIFEST" entrypoint)"
 	APP_REQUIREMENTS_REL="$(_manifest_get "$MANIFEST" requirements)"
@@ -164,7 +224,7 @@ _load_manifest() {
 	m_creds="$(_manifest_get "$MANIFEST" credentials_env_file)"
 
 	# Every scalar except credentials_env_file (optional) is required.
-	for pair in "app_dir=$m_app_dir" "entrypoint=$APP_ENTRYPOINT" \
+	for pair in "name=$APP_NAME" "app_dir=$m_app_dir" "entrypoint=$APP_ENTRYPOINT" \
 		"requirements=$APP_REQUIREMENTS_REL" "port=$APP_PORT" \
 		"health_path=$APP_HEALTH_PATH" "ollama_model=$APP_OLLAMA_MODEL"; do
 		if [ -z "${pair#*=}" ]; then
@@ -172,6 +232,16 @@ _load_manifest() {
 			return 1
 		fi
 	done
+
+	# name becomes the <name> in every DO resource name (F12, #29), so it must be
+	# DNS-label-safe: lowercase letters, digits and hyphens only (no leading/trailing
+	# hyphen). Reject anything else up front rather than let doctl fail mid-provision.
+	case "$APP_NAME" in
+	*[!a-z0-9-]* | -* | *- | "")
+		log_error "manifest name '$APP_NAME' is invalid — use lowercase letters, digits and hyphens (e.g. 'demo'), no leading/trailing hyphen."
+		return 1
+		;;
+	esac
 
 	# app_dir is relative to the manifest; entrypoint/requirements are relative to
 	# the resolved app code dir.
@@ -446,12 +516,9 @@ cmd_setup() {
 
 	# Capture explicit env overrides BEFORE sourcing the stored config (which
 	# would otherwise clobber them).
-	env_region="${DO_REGION:-}"
-	env_cpu="${DO_CPU_SIZE:-}"
-	env_gpu="${DO_GPU_SIZE:-}"
-	env_backend="${OLLAMA_BACKEND:-}"
-	env_ollama_cpu="${DO_OLLAMA_CPU_SIZE:-}"
-	env_enable_fw="${DO_ENABLE_FIREWALL:-}"
+	# Per-env INFRA (region/sizes/backend/firewall) now lives in the app manifest's
+	# deployments.<env> block (F12, #29), so setup is app/env-agnostic and only
+	# bootstraps the MACHINE-local facts: the DO SSH key name + local creds path.
 	env_keyname="${DO_SSH_KEY_NAME:-}"
 	env_creds="${APP_CREDENTIALS_FILE:-}"
 
@@ -504,22 +571,9 @@ cmd_setup() {
 		. "$CONFIG_FILE"
 	fi
 
-	# Ollama backend (#18): cpu (default — cheap, no GPU) or gpu. In cpu mode the
-	# Ollama node is a CPU droplet of DO_OLLAMA_CPU_SIZE instead of a GPU droplet.
-	# Resolved first because it drives the region default (#17).
-	backend="$(_field "$env_backend" "${OLLAMA_BACKEND:-cpu}" "Ollama backend (cpu|gpu)")"
-	# Region is a pure function of the backend (#17, ADR-0008): cpu→blr1, gpu→tor1.
-	# An explicit DO_REGION override still wins; the stored value is NOT used as the
-	# default, so switching backend always re-derives the correct region.
-	region="$(_field "$env_region" "$(_region_for_backend "$backend")" "DigitalOcean region")"
-	cpu="$(_field "$env_cpu" "${DO_CPU_SIZE:-s-2vcpu-4gb}" "CPU droplet size")"
-	gpu="$(_field "$env_gpu" "${DO_GPU_SIZE:-gpu-6000adax1-48gb}" "GPU droplet size")"
-	ollama_cpu="$(_field "$env_ollama_cpu" "${DO_OLLAMA_CPU_SIZE:-s-8vcpu-16gb-amd}" "CPU Ollama node size")"
-	# DO cloud firewall (#19): optional. Ollama is kept off the public net by the
-	# private-IP bind, so the firewall is defense-in-depth — default off (0).
-	enable_fw="$(_field "$env_enable_fw" "${DO_ENABLE_FIREWALL:-0}" "Enable DO firewall (0|1)")"
-	# NB (#27): OLLAMA_MODEL is a per-app fact and now lives in the app's
-	# digital-ocean.yml manifest — setup no longer asks for or stores it.
+	# NB (#27/#29): OLLAMA_MODEL and all per-env infra (region/sizes/backend/firewall)
+	# are per-app/per-env facts and live in the app's digital-ocean.yml manifest —
+	# setup no longer asks for or stores them. It bootstraps only machine-local facts.
 	key_name="$(_field "$env_keyname" "${DO_SSH_KEY_NAME:-$do_key_name}" "DO SSH key name")"
 	creds="$(_field "$env_creds" "${APP_CREDENTIALS_FILE:-$CONFIG_DIR/credentials}" "Local credentials file")"
 
@@ -535,12 +589,7 @@ cmd_setup() {
 	tmp="$CONFIG_FILE.tmp.$$"
 	{
 		printf '# digital-ocean config — written by "digital-ocean setup" (F4). Gitignored; do not commit.\n'
-		_kv DO_REGION "$region"
-		_kv DO_CPU_SIZE "$cpu"
-		_kv DO_GPU_SIZE "$gpu"
-		_kv OLLAMA_BACKEND "$backend"
-		_kv DO_OLLAMA_CPU_SIZE "$ollama_cpu"
-		_kv DO_ENABLE_FIREWALL "$enable_fw"
+		printf '# Machine-local facts only (F12, #29): per-env infra lives in the app manifest.\n'
 		_kv DO_SSH_KEY_NAME "$key_name"
 		_kv APP_CREDENTIALS_FILE "$creds"
 	} >"$tmp"
@@ -673,8 +722,34 @@ write_state() {
 	umask "$old_umask"
 }
 
-# Load .do/config and apply F6 defaults (env override > config > default). Fails
-# if no config exists. Sets DO_REGION, sizes, resource names, and image slugs.
+# Resolve one infra field with precedence: env/config var > manifest deployment >
+# built-in default (F12, #29). VARNAME is the shell/env var (also the config-file
+# key); MANIFEST_KEY is its name under deployments.<env>. When an env/config value
+# overrides a manifest-provided one, log it (source + old→new) so an unexpected
+# region/size is easy to trace. Uses eval for indirection (no bash arrays — zsh-safe).
+_resolve_field() { # varname manifest_key default
+	_rf_var="$1"
+	_rf_key="$2"
+	_rf_def="$3"
+	eval "_rf_env=\"\${$_rf_var:-}\""
+	_rf_man="$(_manifest_get_deployment "$MANIFEST" "$DEPLOY_ENV" "$_rf_key")"
+	if [ -n "$_rf_env" ]; then
+		if [ -n "$_rf_man" ] && [ "$_rf_env" != "$_rf_man" ]; then
+			log_info "$_rf_key: using '$_rf_env' ($_rf_var overrides manifest '$_rf_man')"
+		fi
+		eval "$_rf_var=\"\$_rf_env\""
+	elif [ -n "$_rf_man" ]; then
+		eval "$_rf_var=\"\$_rf_man\""
+	else
+		eval "$_rf_var=\"\$_rf_def\""
+	fi
+}
+
+# Load .do/config + the app manifest, then resolve the per-env infra (F12, #29).
+# The MANIFEST (deployments.<env>) is the source of truth for region/backend/sizes/
+# firewall; .do/config now carries only machine-local facts (DO_SSH_KEY_NAME,
+# APP_CREDENTIALS_FILE). Precedence per field: env/config var > manifest > default.
+# Requires --app-dir (via _load_manifest) — so does its caller `start`.
 _provision_load_config() {
 	if [ ! -f "$CONFIG_FILE" ]; then
 		log_error "no config at $CONFIG_FILE — run 'digital-ocean setup' first."
@@ -684,34 +759,45 @@ _provision_load_config() {
 	# shellcheck disable=SC1090
 	. "$CONFIG_FILE"
 
-	# Ollama backend (#18) + optional firewall (#19). Resolved before the region,
-	# which is derived from it (#17).
-	OLLAMA_BACKEND="${OLLAMA_BACKEND:-cpu}"
-	DO_OLLAMA_CPU_SIZE="${DO_OLLAMA_CPU_SIZE:-s-8vcpu-16gb-amd}"
-	DO_ENABLE_FIREWALL="${DO_ENABLE_FIREWALL:-0}"
+	# The manifest supplies APP_NAME (the resource-name prefix) + the per-env infra
+	# block. This makes --app-dir required for provision/start.
+	_load_manifest || return $?
+
+	# Ollama backend (#18) — resolved before the region, which is derived from it
+	# (#17). NB the APP node is always CPU; only the OLLAMA node varies cpu/gpu,
+	# hence the manifest key `ollama_backend`.
+	_resolve_field OLLAMA_BACKEND ollama_backend cpu
 	if [ "$OLLAMA_BACKEND" != cpu ] && [ "$OLLAMA_BACKEND" != gpu ]; then
-		log_error "OLLAMA_BACKEND must be 'cpu' or 'gpu' (got '$OLLAMA_BACKEND')."
+		log_error "ollama_backend must be 'cpu' or 'gpu' (got '$OLLAMA_BACKEND')."
 		return 1
 	fi
-	# Region is backend-aware (#17, ADR-0008): cpu→blr1, gpu→tor1. setup writes a
-	# backend-consistent DO_REGION, so this derivation is the safety net for a
-	# hand-written config that omits the key (a stored value still wins).
-	DO_REGION="${DO_REGION:-$(_region_for_backend "$OLLAMA_BACKEND")}"
-	DO_CPU_SIZE="${DO_CPU_SIZE:-s-2vcpu-4gb}"
-	DO_GPU_SIZE="${DO_GPU_SIZE:-gpu-6000adax1-48gb}"
+	# Region is backend-aware (#17, ADR-0008): cpu→blr1, gpu→tor1 — the default when
+	# the manifest omits `region`.
+	_resolve_field DO_REGION region "$(_region_for_backend "$OLLAMA_BACKEND")"
+	_resolve_field DO_CPU_SIZE app_size s-2vcpu-4gb
+	_resolve_field DO_GPU_SIZE ollama_gpu_size gpu-6000adax1-48gb
+	_resolve_field DO_OLLAMA_CPU_SIZE ollama_cpu_size s-8vcpu-16gb-amd
+	# Firewall (#19): manifest may say true/false; normalize to the internal 1/0.
+	_resolve_field DO_ENABLE_FIREWALL firewall 0
+	case "$DO_ENABLE_FIREWALL" in
+	1 | true | TRUE | True | yes | on) DO_ENABLE_FIREWALL=1 ;;
+	*) DO_ENABLE_FIREWALL=0 ;;
+	esac
+
 	# Default so a config missing this key gives the clean "key not found" error
 	# below rather than a set -u "unbound variable" crash.
 	DO_SSH_KEY_NAME="${DO_SSH_KEY_NAME:-}"
-	# Resource names — fixed hello-do- prefix, overridable via env/config.
-	# VPC name is region-scoped (#17): a DO VPC is bound to one region, and the
-	# backend-aware regions (blr1/tor1) must not collide on a shared name — a
-	# same-named VPC in another region would be adopted and then fail droplet
-	# create ("Failed to resolve VPC"). Deriving per region gives each its own.
-	DO_VPC_NAME="${DO_VPC_NAME:-hello-do-vpc-$DO_REGION}"
-	DO_DATA_VOLUME_NAME="${DO_DATA_VOLUME_NAME:-hello-do-data}"
-	DO_MODELS_VOLUME_NAME="${DO_MODELS_VOLUME_NAME:-hello-do-models}"
-	DO_CPU_NAME="${DO_CPU_NAME:-hello-do-cpu}"
-	DO_GPU_NAME="${DO_GPU_NAME:-hello-do-gpu}"
+	# Resource names — derived from <name>-<env> (#29), still env-overridable.
+	# VPC name keeps its region suffix (#17): a DO VPC is bound to one region, so a
+	# same-named VPC in another region would be adopted then fail droplet create
+	# ("Failed to resolve VPC"). <name>-<env>-vpc-<region> gives each its own.
+	_name_prefix="${APP_NAME}-${DEPLOY_ENV}"
+	DO_VPC_NAME="${DO_VPC_NAME:-${_name_prefix}-vpc-$DO_REGION}"
+	DO_DATA_VOLUME_NAME="${DO_DATA_VOLUME_NAME:-${_name_prefix}-data}"
+	DO_MODELS_VOLUME_NAME="${DO_MODELS_VOLUME_NAME:-${_name_prefix}-models}"
+	DO_CPU_NAME="${DO_CPU_NAME:-${_name_prefix}-backend}"
+	# The ollama node's name suffix tracks its backend (#29): -ollama-cpu / -ollama-gpu.
+	DO_GPU_NAME="${DO_GPU_NAME:-${_name_prefix}-ollama-$OLLAMA_BACKEND}"
 	# Volume sizes in GiB (ADR-0003 defaults).
 	DO_DATA_SIZE="${DO_DATA_SIZE:-10}"
 	DO_MODELS_SIZE="${DO_MODELS_SIZE:-50}"
@@ -1395,6 +1481,20 @@ main() {
 			APP_DIR_OPT="${1#--app-dir=}"
 			shift
 			;;
+		--env)
+			# Global option (F12, #29): select the deployment environment.
+			if [ $# -lt 2 ]; then
+				log_error "--env requires an argument (prod|staging)"
+				usage >&2
+				return 2
+			fi
+			DEPLOY_ENV="$2"
+			shift 2
+			;;
+		--env=*)
+			DEPLOY_ENV="${1#--env=}"
+			shift
+			;;
 		--)
 			shift
 			break
@@ -1409,6 +1509,17 @@ main() {
 			;;
 		esac
 	done
+
+	# Validate + apply the deployment env now that flags are parsed (F12, #29).
+	case "$DEPLOY_ENV" in
+	prod | staging) ;;
+	*)
+		log_error "--env must be 'prod' or 'staging' (got '$DEPLOY_ENV')."
+		usage >&2
+		return 2
+		;;
+	esac
+	_resolve_state_file
 
 	if [ $# -eq 0 ]; then
 		# No command — keep the skeleton banner (used by F1's smoke tests).

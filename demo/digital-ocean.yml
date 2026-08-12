@@ -1,13 +1,16 @@
-# digital-ocean.yml — deploy manifest for the reference "demo" app (F11, #27).
+# digital-ocean.yml — deploy manifest for the reference "demo" app (F11 #27, F12 #29).
 #
 # The `digital-ocean` CLI reads this file (via `--app-dir demo`) to learn the
 # app's facts, instead of hardcoding them. Any conforming app ships its own
 # copy of this manifest in its app dir. `infra/` stays tool-owned.
 #
-# Flat "key: value" only — the CLI parses this with a minimal pure-shell reader
-# (no jq/yq). Keep it flat; if it ever needs nested maps/lists, the CLI note in
-# bin/digital-ocean (_manifest_get) calls for switching to a real YAML parser.
+# Two readers, both pure-shell (no jq/yq): a flat "key: value" reader for the
+# shared top-level keys, and a minimal 2-level reader for the `deployments:` map
+# (see _manifest_get / _manifest_get_deployment in bin/digital-ocean).
 
+name: demo                 # required (#29): the <name> in every DO resource name; DNS-safe [a-z0-9-]
+
+# --- shared across environments (top-level, flat reader) --------------------
 app_dir: .                 # app code root, relative to THIS manifest (rsynced to /opt/app/app)
 entrypoint: app.py         # python entrypoint, relative to app_dir
 requirements: requirements.txt   # pip -r target, relative to app_dir
@@ -15,3 +18,22 @@ port: 5000                 # port the app binds/serves on
 health_path: /health       # readiness endpoint (must report app + Ollama health)
 ollama_model: llama3.2:1b  # model the app needs (pulled on the Ollama node)
 credentials_env_file: true # ship /etc/app/credentials as a systemd EnvironmentFile
+
+# --- per-environment infra (#29; selected with --env, default prod) ---------
+# Source of truth for region/backend/sizes/firewall. An env var (e.g. DO_REGION)
+# still overrides a value here and the CLI logs the override.
+deployments:
+  prod:
+    region: blr1                     # cpu backend lives in blr1 (#17, ADR-0008)
+    ollama_backend: cpu              # the OLLAMA node's backend (the app node is always CPU)
+    app_size: s-2vcpu-4gb            # app/backend droplet size
+    ollama_cpu_size: s-8vcpu-16gb-amd  # ollama node size when backend is cpu
+    ollama_gpu_size: gpu-6000adax1-48gb  # ollama node size when backend is gpu
+    firewall: false                  # DO cloud firewall (Ollama is private via VPC-IP bind)
+  staging:
+    region: blr1
+    ollama_backend: cpu
+    app_size: s-2vcpu-4gb
+    ollama_cpu_size: s-8vcpu-16gb-amd
+    ollama_gpu_size: gpu-6000adax1-48gb
+    firewall: false

@@ -38,17 +38,14 @@ setup() {
 	export PATH="$SHIM:/usr/bin:/bin"
 }
 
-# A valid .do/config as F4's `setup` would write it.
+# A valid .do/config as F4's `setup` would write it — machine-local facts only (#29).
 _write_config() {
 	cat >"$CONFIG_DIR/config" <<EOF
-DO_REGION='blr1'
-DO_CPU_SIZE='s-2vcpu-4gb'
-DO_GPU_SIZE='gpu-6000adax1-48gb'
 DO_SSH_KEY_NAME='my-mac'
 APP_CREDENTIALS_FILE='$CONFIG_DIR/credentials'
 EOF
-	# #27 (F11): the model is a per-app fact, read from the manifest (--app-dir demo),
-	# NOT from the infra config — so it is deliberately absent above.
+	# Per-app/per-env facts (the model + region/sizes/backend/firewall) are read from
+	# the app manifest (--app-dir demo, deployments.prod), NOT the infra config (#27/#29).
 }
 
 _write_creds() {
@@ -85,8 +82,8 @@ done
 _id() { printf 'id-%s' "$1"; }
 _ips() {
 	case "$1" in
-	*-cpu) echo "203.0.113.10 10.10.0.10";;
-	*-gpu) echo "203.0.113.20 10.10.0.20";;
+	*-backend) echo "203.0.113.10 10.10.0.10";;
+	*-ollama-*) echo "203.0.113.20 10.10.0.20";;
 	*) echo "203.0.113.99 10.10.0.99";;
 	esac
 }
@@ -232,11 +229,11 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "start reuses F6 provisioning — VPC, volumes, droplets, attach, state" {
 	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
-	[ -f "$CONFIG_DIR/state" ]
+	[ -f "$CONFIG_DIR/state.prod" ]
 	[ "$(_count droplet)" -eq 2 ]
 	[ "$(_count volume)" -eq 2 ]
-	grep -q "id-hello-do-data id-hello-do-cpu" "$REG/attach"
-	grep -q "id-hello-do-models id-hello-do-gpu" "$REG/attach"
+	grep -q "id-demo-prod-data id-demo-prod-backend" "$REG/attach"
+	grep -q "id-demo-prod-models id-demo-prod-ollama-cpu" "$REG/attach"
 }
 
 # --- firewall: optional (#19) -----------------------------------------------
@@ -246,32 +243,32 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# No firewall was created or assigned…
-	[ ! -s "$REG/fw" ] || run grep -q "create hello-do" "$REG/fw"
+	[ ! -s "$REG/fw" ] || run grep -q "create demo-prod" "$REG/fw"
 	run grep -E "firewall create" "$REG/calls"
 	[ "$status" -ne 0 ]
 	# …and the firewall IDs in state are empty.
-	grep -q "DO_CPU_FW_ID=''" "$CONFIG_DIR/state"
-	grep -q "DO_GPU_FW_ID=''" "$CONFIG_DIR/state"
+	grep -q "DO_CPU_FW_ID=''" "$CONFIG_DIR/state.prod"
+	grep -q "DO_GPU_FW_ID=''" "$CONFIG_DIR/state.prod"
 }
 
 @test "start ensures two firewalls when DO_ENABLE_FIREWALL=1: cpu (5000+22 public) and gpu (11434 from VPC)" {
 	DO_ENABLE_FIREWALL=1 run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# Both firewalls created and recorded in state.
-	grep -q "create hello-do-cpu-fw" "$REG/fw"
-	grep -q "create hello-do-gpu-fw" "$REG/fw"
-	grep -q "DO_CPU_FW_ID='id-hello-do-cpu-fw'" "$CONFIG_DIR/state"
-	grep -q "DO_GPU_FW_ID='id-hello-do-gpu-fw'" "$CONFIG_DIR/state"
+	grep -q "create demo-prod-backend-fw" "$REG/fw"
+	grep -q "create demo-prod-ollama-cpu-fw" "$REG/fw"
+	grep -q "DO_CPU_FW_ID='id-demo-prod-backend-fw'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_GPU_FW_ID='id-demo-prod-ollama-cpu-fw'" "$CONFIG_DIR/state.prod"
 	# GPU firewall's 11434 rule is sourced from the VPC IP range, not 0.0.0.0/0.
-	gpu_create="$(grep -E "firewall create .*hello-do-gpu-fw" "$REG/calls")"
+	gpu_create="$(grep -E "firewall create .*demo-prod-ollama-cpu-fw" "$REG/calls")"
 	echo "$gpu_create" | grep -q "ports:11434,address:10.10.0.0/20"
 	echo "$gpu_create" | grep -qv "ports:11434,address:0.0.0.0/0"
 	# CPU firewall exposes 5000 publicly.
-	cpu_create="$(grep -E "firewall create .*hello-do-cpu-fw" "$REG/calls")"
+	cpu_create="$(grep -E "firewall create .*demo-prod-backend-fw" "$REG/calls")"
 	echo "$cpu_create" | grep -q "ports:5000,address:0.0.0.0/0"
 	# Each firewall is assigned its droplet.
-	grep -q "add-droplets id-hello-do-cpu" "$REG/fw"
-	grep -q "add-droplets id-hello-do-gpu" "$REG/fw"
+	grep -q "add-droplets id-demo-prod-backend" "$REG/fw"
+	grep -q "add-droplets id-demo-prod-ollama-cpu" "$REG/fw"
 }
 
 @test "start hard-fails when a firewall is requested (=1) but the token lacks scope" {
@@ -300,7 +297,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	node="$(_ssh_to 203.0.113.20)"
 	echo "$node" | grep -q "provision-ollama-cpu.sh"
 	echo "$node" | grep -qv "provision-gpu.sh"
-	echo "$node" | grep -q "MODELS_VOLUME_NAME=hello-do-models"
+	echo "$node" | grep -q "MODELS_VOLUME_NAME=demo-prod-models"
 	# C8: ollama pull of the configured model, on the Ollama node.
 	echo "$node" | grep -q "ollama pull llama3.2:1b"
 }
@@ -328,7 +325,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "cpu backend: the Ollama droplet is created with the CPU size (DO_OLLAMA_CPU_SIZE default)" {
 	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
-	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
+	node_create="$(grep -E "droplet create demo-prod-ollama-cpu" "$REG/calls")"
 	echo "$node_create" | grep -q "s-8vcpu-16gb-amd"
 	echo "$node_create" | grep -qv "gpu-6000adax1-48gb"
 }
@@ -336,7 +333,8 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "gpu backend: the Ollama droplet is created with the GPU size" {
 	OLLAMA_BACKEND=gpu run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
-	node_create="$(grep -E "droplet create hello-do-gpu" "$REG/calls")"
+	# With the gpu backend the ollama node's name suffix is -ollama-gpu (#29).
+	node_create="$(grep -E "droplet create demo-prod-ollama-gpu" "$REG/calls")"
 	echo "$node_create" | grep -q "gpu-6000adax1-48gb"
 }
 
@@ -345,7 +343,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$status" -eq 0 ]
 	cpu="$(_ssh_to 203.0.113.10)"
 	echo "$cpu" | grep -q "provision-cpu.sh"
-	echo "$cpu" | grep -q "DATA_VOLUME_NAME=hello-do-data"
+	echo "$cpu" | grep -q "DATA_VOLUME_NAME=demo-prod-data"
 	# #27: the CLI drives the tool-owned infra script with the manifest's
 	# requirements at the app's /opt/app/app location (no hardcoded demo/ path).
 	echo "$cpu" | grep -q "REQUIREMENTS_FILE=/opt/app/app/requirements.txt"
@@ -380,8 +378,8 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# #27: the deployed app facts land in state so status/logs stay manifest-free.
-	grep -q "APP_PORT='5000'" "$CONFIG_DIR/state"
-	grep -q "APP_HEALTH_PATH='/health'" "$CONFIG_DIR/state"
+	grep -q "APP_PORT='5000'" "$CONFIG_DIR/state.prod"
+	grep -q "APP_HEALTH_PATH='/health'" "$CONFIG_DIR/state.prod"
 }
 
 @test "start health-checks Ollama (private) and the app /health, then reports healthy" {

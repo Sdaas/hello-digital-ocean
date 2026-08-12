@@ -235,6 +235,38 @@ This file remains the home for design notes that emerge during per-feature
   `jq`/`yq` — matches the repo's dependency-light ethos); a code note flags that a
   real YAML parser is warranted **only if** the manifest grows nested structure (YAGNI).
   `demo/digital-ocean.yml` is the reference manifest; the demo runs via `--app-dir demo`.
+- **Manifest `name` + environments (F12, #29):** resource names are derived from
+  the app, not hardcoded `hello-do-*`, so two apps (or two envs of one app) never
+  collide. The manifest gains a required **`name:`** (DNS-safe `[a-z0-9-]`, e.g.
+  `demo`) and a **`deployments:`** map keyed by environment — **`prod`** (default)
+  and **`staging`**. A global **`--env prod|staging`** flag (default `prod`) selects
+  the deployment; **one spelling everywhere** (map key = CLI value = name token),
+  so no long/short mapping. Key decisions:
+  (1) **Naming** derives from `<name>-<env>-…`: app node `<name>-<env>-backend`,
+  ollama node `<name>-<env>-ollama-<ollama_backend>` (`-cpu`/`-gpu`), volumes
+  `<name>-<env>-data|models`, VPC `<name>-<env>-vpc-<region>` (VPC keeps its
+  region suffix — a DO VPC binds to one region, #17). Each is still env-overridable
+  (`DO_CPU_NAME` etc.); the defaults just changed.
+  (2) **The manifest is the source of truth for per-env infra** — `region`,
+  `ollama_backend` (`cpu|gpu`; the **app** node is always CPU, only the **ollama**
+  node varies — hence the `ollama_` prefix), `app_size`, `ollama_cpu_size`,
+  `ollama_gpu_size`, `firewall` — read from `deployments.<env>`. **Shared** app
+  facts (`app_dir`/`entrypoint`/`requirements`/`port`/`health_path`/`ollama_model`)
+  stay top-level. Precedence: **env var > manifest `deployments.<env>` > built-in
+  default**; when an env var wins, the CLI **logs the override** (source + old→new)
+  for debuggability.
+  (3) **`.do/config` shrinks to machine/account-local** — only `DO_SSH_KEY_NAME` +
+  `APP_CREDENTIALS_FILE` (a local secrets path, deliberately **not** in the
+  committed manifest). `setup` drops the region/sizes/backend/firewall interview
+  and stays app/env-agnostic.
+  (4) **Per-env run-state:** `.do/state.<env>` (`.do/state.prod`,
+  `.do/state.staging`) so prod and staging never clobber each other's IDs.
+  `provision`/`start` need `--app-dir` **and** `--env`; `stop`/`destroy`/`status`/
+  `ssh`/`logs` need only `--env` (they read IDs from the state file).
+  (5) YAML nesting is read by a **minimal 2-level pure-sh reader**
+  (`_manifest_get_deployment`) — still no `jq`/`yq` (the F11 YAGNI note anticipated
+  this). No backward-compat (no live deploys predate this). Verified with `demo/`
+  (`name: demo`, `prod`/`staging` deployments); live VERIFY `--app-dir demo --env prod`.
 
 ## Constraints
 
