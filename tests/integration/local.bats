@@ -1,9 +1,11 @@
 #!/usr/bin/env bats
 #
-# Opt-in, UN-MOCKED end-to-end for `digital-ocean local` (F3). Runs the REAL
-# flow: builds the venv from demo/requirements.txt, launches Flask with
-# APP_ENV=LOCAL, hits the real /health, then tears down. This is the required
-# real-boundary counterpart to the mocked fast lane (tests/local.bats).
+# Opt-in, UN-MOCKED end-to-end for `digital-ocean local` (F3, generalized in
+# F11/#27). Runs the REAL flow against the demo app (--app-dir demo): builds the
+# venv from the manifest's requirements, launches the app with the explicit env
+# contract (HOST/PORT/OLLAMA_* from the manifest), hits the real /health, then
+# tears down. The required real-boundary counterpart to the mocked fast lane
+# (tests/local.bats).
 #
 # Self-skips when local Ollama isn't reachable, so `./test.sh --integration`
 # stays green without a running model backend. Home is LOCAL / nightly; PR CI
@@ -19,11 +21,11 @@ setup() {
 }
 
 teardown() {
-	./bin/digital-ocean local down >/dev/null 2>&1 || true
+	./bin/digital-ocean --app-dir demo local down >/dev/null 2>&1 || true
 }
 
 @test "local: starts app, /health reports LOCAL + ollama_reachable, down stops it" {
-	run $DO local
+	run $DO --app-dir demo local
 	[ "$status" -eq 0 ]
 	echo "$output" | grep -q "127.0.0.1:5000"
 
@@ -34,12 +36,12 @@ teardown() {
 	echo "$output" | grep -Eq '"ollama_reachable": *true'
 
 	# Teardown stops it cleanly...
-	run $DO local down
+	run $DO --app-dir demo local down
 	[ "$status" -eq 0 ]
 	echo "$output" | grep -q "stopped"
 
 	# ...and a second down is a friendly no-op.
-	run $DO local down
+	run $DO --app-dir demo local down
 	[ "$status" -eq 0 ]
 	echo "$output" | grep -q "not running"
 }
