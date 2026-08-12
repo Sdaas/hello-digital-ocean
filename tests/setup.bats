@@ -61,40 +61,20 @@ EOF
 	echo "$output" | grep -q "setup"
 }
 
-@test "setup --non-interactive writes .do/config with defaults and exits 0" {
+@test "setup --non-interactive writes .do/config with machine-local facts and exits 0" {
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	[ -f "$CONFIG_DIR/config" ]
-	# #17: region is backend-aware — the default (cpu) backend lives in blr1.
-	grep -q "DO_REGION='blr1'" "$CONFIG_DIR/config"
-	grep -q "DO_CPU_SIZE='s-2vcpu-4gb'" "$CONFIG_DIR/config"
-	grep -q "DO_GPU_SIZE='gpu-6000adax1-48gb'" "$CONFIG_DIR/config"
-	# #27 (F11): OLLAMA_MODEL is a per-app fact — it now lives in the app's
-	# digital-ocean.yml manifest, NOT the infra config. setup must not write it.
-	# (count form, not `! grep`: a mid-test `!`-pipeline failure is silently ignored.)
-	[ "$(grep -c "OLLAMA_MODEL" "$CONFIG_DIR/config")" -eq 0 ]
-	# #18/#19: selectable backend (default cpu), CPU Ollama node size, optional firewall.
-	grep -q "OLLAMA_BACKEND='cpu'" "$CONFIG_DIR/config"
-	grep -q "DO_OLLAMA_CPU_SIZE='s-8vcpu-16gb-amd'" "$CONFIG_DIR/config"
-	grep -q "DO_ENABLE_FIREWALL='0'" "$CONFIG_DIR/config"
-}
-
-@test "setup records an OLLAMA_BACKEND env override (gpu)" {
-	OLLAMA_BACKEND=gpu run $DO setup --non-interactive
-	[ "$status" -eq 0 ]
-	grep -q "OLLAMA_BACKEND='gpu'" "$CONFIG_DIR/config"
-}
-
-@test "#17: the gpu backend derives the tor1 region (only affordable DO GPU)" {
-	OLLAMA_BACKEND=gpu run $DO setup --non-interactive
-	[ "$status" -eq 0 ]
-	grep -q "DO_REGION='tor1'" "$CONFIG_DIR/config"
-}
-
-@test "#17: an explicit DO_REGION still overrides the backend-derived default" {
-	OLLAMA_BACKEND=gpu DO_REGION=nyc2 run $DO setup --non-interactive
-	[ "$status" -eq 0 ]
-	grep -q "DO_REGION='nyc2'" "$CONFIG_DIR/config"
+	# #29 (F12): setup writes ONLY machine-local facts — the DO SSH key name and the
+	# local credentials-file path. Per-env infra (region/sizes/backend/firewall) is a
+	# per-app/per-env fact that now lives in the app manifest's deployments.<env>.
+	grep -q "DO_SSH_KEY_NAME='my-mac'" "$CONFIG_DIR/config"
+	grep -q "APP_CREDENTIALS_FILE=" "$CONFIG_DIR/config"
+	# The infra keys setup used to write must be GONE (count form, not `! grep`: a
+	# mid-test `!`-pipeline failure is silently ignored by bats).
+	for k in DO_REGION DO_CPU_SIZE DO_GPU_SIZE OLLAMA_BACKEND DO_OLLAMA_CPU_SIZE DO_ENABLE_FIREWALL OLLAMA_MODEL; do
+		[ "$(grep -c "^$k=" "$CONFIG_DIR/config")" -eq 0 ]
+	done
 }
 
 @test "setup captures the DO-registered key name from doctl" {
@@ -103,10 +83,10 @@ EOF
 	grep -q "DO_SSH_KEY_NAME='my-mac'" "$CONFIG_DIR/config"
 }
 
-@test "an env override wins over the default" {
-	DO_REGION=nyc1 run $DO setup --non-interactive
+@test "an explicit DO_SSH_KEY_NAME env override wins over the doctl-detected key" {
+	DO_SSH_KEY_NAME=my-other-key run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
-	grep -q "DO_REGION='nyc1'" "$CONFIG_DIR/config"
+	grep -q "DO_SSH_KEY_NAME='my-other-key'" "$CONFIG_DIR/config"
 }
 
 @test "setup ensures the credentials file exists" {
@@ -145,24 +125,24 @@ EOF
 	echo "$output" | grep -q "ssh-key import"
 }
 
-@test "re-run is idempotent — a single DO_REGION line, still valid" {
+@test "re-run is idempotent — a single DO_SSH_KEY_NAME line, still valid" {
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
-	[ "$(grep -c '^DO_REGION=' "$CONFIG_DIR/config")" -eq 1 ]
+	[ "$(grep -c '^DO_SSH_KEY_NAME=' "$CONFIG_DIR/config")" -eq 1 ]
 }
 
 @test "a prior config value becomes the default on re-run" {
-	# Region is now a pure function of backend (#17), and OLLAMA_MODEL moved to the
-	# manifest (#27), so exercise "prior value persists" with DO_CPU_SIZE — a field
-	# still seeded from stored config.
-	DO_CPU_SIZE=s-4vcpu-8gb run $DO setup --non-interactive
+	# Exercise "prior value persists" with APP_CREDENTIALS_FILE — a field still
+	# seeded from stored config (per-env infra moved to the manifest, #29).
+	custom="$BATS_TEST_TMPDIR/my-creds"
+	APP_CREDENTIALS_FILE="$custom" run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
 	# Second run without the override should preserve the stored value.
 	run $DO setup --non-interactive
 	[ "$status" -eq 0 ]
-	grep -q "DO_CPU_SIZE='s-4vcpu-8gb'" "$CONFIG_DIR/config"
+	grep -q "APP_CREDENTIALS_FILE='$custom'" "$CONFIG_DIR/config"
 }
 
 @test "a value with a single quote round-trips (config stays sourceable)" {

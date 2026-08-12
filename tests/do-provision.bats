@@ -19,26 +19,57 @@ setup() {
 	CONFIG_DIR="$BATS_TEST_TMPDIR/do"
 	SHIM="$BATS_TEST_TMPDIR/bin"
 	REG="$BATS_TEST_TMPDIR/reg"
-	mkdir -p "$CONFIG_DIR" "$SHIM" "$REG"
+	APP="$BATS_TEST_TMPDIR/app"
+	mkdir -p "$CONFIG_DIR" "$SHIM" "$REG" "$APP"
 
 	# Config + state land in a throwaway dir, never the real repo .do/.
 	export DO_CONFIG_DIR="$CONFIG_DIR"
 	# Registry dir the doctl stub reads/writes (its "cloud").
 	export DOCTL_REG="$REG"
+	# Per-env infra (region/backend/sizes) now comes from the app manifest (#29).
+	# Export DO_APP_DIR so every `$DO provision` here picks it up without --app-dir
+	# on each call; --env defaults to prod → resources are named demo-prod-*.
+	_write_manifest
+	export DO_APP_DIR="$APP"
 
 	_write_config
 	_shim_doctl
 	export PATH="$SHIM:/usr/bin:/bin"
 }
 
-# A valid .do/config as F4's `setup` would write it. DO_SSH_KEY_NAME matches the
-# key the doctl stub reports, so key resolution succeeds by default.
+# A minimal app manifest (name + a prod/staging deployments block, #29). name
+# 'demo' + env 'prod' → the demo-prod-* resource names asserted below.
+_write_manifest() {
+	cat >"$APP/digital-ocean.yml" <<'EOF'
+name: demo
+app_dir: .
+entrypoint: app.py
+requirements: requirements.txt
+port: 5000
+health_path: /health
+ollama_model: llama3.2:1b
+credentials_env_file: true
+deployments:
+  prod:
+    region: blr1
+    ollama_backend: cpu
+    app_size: s-2vcpu-4gb
+    ollama_cpu_size: s-8vcpu-16gb-amd
+    firewall: false
+  staging:
+    region: blr1
+    ollama_backend: cpu
+    app_size: s-2vcpu-4gb
+    ollama_cpu_size: s-8vcpu-16gb-amd
+    firewall: false
+EOF
+}
+
+# A valid .do/config as F4's `setup` would write it — now just machine-local facts
+# (#29): DO_SSH_KEY_NAME matches the key the doctl stub reports (resolution
+# succeeds by default) + the local credentials-file path.
 _write_config() {
 	cat >"$CONFIG_DIR/config" <<EOF
-DO_REGION='blr1'
-DO_CPU_SIZE='s-2vcpu-4gb'
-DO_GPU_SIZE='gpu-6000adax1-48gb'
-OLLAMA_MODEL='llama3.2:1b'
 DO_SSH_KEY_NAME='my-mac'
 APP_CREDENTIALS_FILE='$CONFIG_DIR/credentials'
 EOF
@@ -74,8 +105,8 @@ done
 _id() { printf 'id-%s' "$1"; }
 _ips() { # name -> "PUB PRIV"
 	case "$1" in
-	*-cpu) echo "203.0.113.10 10.10.0.10";;
-	*-gpu) echo "203.0.113.20 10.10.0.20";;
+	*-backend) echo "203.0.113.10 10.10.0.10";;
+	*-ollama-*) echo "203.0.113.20 10.10.0.20";;
 	*) echo "203.0.113.99 10.10.0.99";;
 	esac
 }
@@ -166,16 +197,63 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "provision writes .do/state with VPC, volumes, droplets and IPs (exit 0)" {
 	run $DO provision
 	[ "$status" -eq 0 ]
-	[ -f "$CONFIG_DIR/state" ]
+	[ -f "$CONFIG_DIR/state.prod" ]
 	# #17: VPC name is region-scoped (VPCs are region-bound; backend-aware regions
-	# must not collide on a shared name), so the blr1 config yields hello-do-vpc-blr1.
-	grep -q "DO_VPC_ID='id-hello-do-vpc-blr1'" "$CONFIG_DIR/state"
-	grep -q "DO_DATA_VOLUME_ID='id-hello-do-data'" "$CONFIG_DIR/state"
-	grep -q "DO_MODELS_VOLUME_ID='id-hello-do-models'" "$CONFIG_DIR/state"
-	grep -q "DO_CPU_DROPLET_ID='id-hello-do-cpu'" "$CONFIG_DIR/state"
-	grep -q "DO_GPU_DROPLET_ID='id-hello-do-gpu'" "$CONFIG_DIR/state"
-	grep -q "DO_CPU_PUBLIC_IP='203.0.113.10'" "$CONFIG_DIR/state"
-	grep -q "DO_GPU_PRIVATE_IP='10.10.0.20'" "$CONFIG_DIR/state"
+	# must not collide on a shared name), so the blr1 config yields demo-prod-vpc-blr1.
+	grep -q "DO_VPC_ID='id-demo-prod-vpc-blr1'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_DATA_VOLUME_ID='id-demo-prod-data'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_MODELS_VOLUME_ID='id-demo-prod-models'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_CPU_DROPLET_ID='id-demo-prod-backend'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_GPU_DROPLET_ID='id-demo-prod-ollama-cpu'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_CPU_PUBLIC_IP='203.0.113.10'" "$CONFIG_DIR/state.prod"
+	grep -q "DO_GPU_PRIVATE_IP='10.10.0.20'" "$CONFIG_DIR/state.prod"
+}
+
+@test "#29: --env staging names resources demo-staging-* in a separate state file" {
+	run $DO --env staging provision
+	[ "$status" -eq 0 ]
+	# Staging state is its own file, kept apart from prod's.
+	[ -f "$CONFIG_DIR/state.staging" ]
+	[ ! -f "$CONFIG_DIR/state.prod" ]
+	grep -q "DO_VPC_ID='id-demo-staging-vpc-blr1'" "$CONFIG_DIR/state.staging"
+	grep -q "DO_DATA_VOLUME_ID='id-demo-staging-data'" "$CONFIG_DIR/state.staging"
+	grep -q "DO_CPU_DROPLET_ID='id-demo-staging-backend'" "$CONFIG_DIR/state.staging"
+	grep -q "DO_GPU_DROPLET_ID='id-demo-staging-ollama-cpu'" "$CONFIG_DIR/state.staging"
+}
+
+@test "#29: prod and staging can coexist — each in its own state file" {
+	run $DO --env prod provision
+	[ "$status" -eq 0 ]
+	run $DO --env staging provision
+	[ "$status" -eq 0 ]
+	[ -f "$CONFIG_DIR/state.prod" ]
+	[ -f "$CONFIG_DIR/state.staging" ]
+	# Two of each resource-kind now exist (one per env), proving no collision.
+	[ "$(_count droplet)" -eq 4 ]
+	[ "$(_count volume)" -eq 4 ]
+}
+
+@test "#29: the ollama node name tracks the ollama backend (gpu → -ollama-gpu)" {
+	# ollama_backend comes from the manifest; an env override still wins (and logs).
+	OLLAMA_BACKEND=gpu run $DO provision
+	[ "$status" -eq 0 ]
+	grep -q "DO_GPU_DROPLET_ID='id-demo-prod-ollama-gpu'" "$CONFIG_DIR/state.prod"
+}
+
+@test "#29: an env var overriding a manifest infra value is logged" {
+	# DO_REGION (env) overrides the manifest's blr1 → the override is announced.
+	DO_REGION=tor1 run $DO provision
+	[ "$status" -eq 0 ]
+	printf '%s' "$output" | grep -qi "DO_REGION overrides manifest"
+	grep -q "DO_VPC_ID='id-demo-prod-vpc-tor1'" "$CONFIG_DIR/state.prod"
+}
+
+@test "provision requires --app-dir/manifest (fails without one)" {
+	# Unset the DO_APP_DIR fallback so no app is selected.
+	unset DO_APP_DIR
+	run $DO provision
+	[ "$status" -ne 0 ]
+	printf '%s' "$output" | grep -qi 'app-dir'
 }
 
 @test "#17: the VPC name is region-scoped so regions never collide" {
@@ -185,7 +263,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 		>"$CONFIG_DIR/config.new" && mv "$CONFIG_DIR/config.new" "$CONFIG_DIR/config"
 	run $DO provision
 	[ "$status" -eq 0 ]
-	grep -q "DO_VPC_ID='id-hello-do-vpc-tor1'" "$CONFIG_DIR/state"
+	grep -q "DO_VPC_ID='id-demo-prod-vpc-tor1'" "$CONFIG_DIR/state.prod"
 }
 
 @test "provision writes state file with private (0600) perms" {
@@ -193,15 +271,15 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	[ "$status" -eq 0 ]
 	# GNU stat (-c, Linux/CI) first; fall back to BSD stat (-f, macOS). The old
 	# order broke on Linux: GNU `stat -f` doesn't error, so the fallback never ran.
-	perms="$(stat -c '%a' "$CONFIG_DIR/state" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/state")"
+	perms="$(stat -c '%a' "$CONFIG_DIR/state.prod" 2>/dev/null || stat -f '%Lp' "$CONFIG_DIR/state.prod")"
 	[ "$perms" = "600" ]
 }
 
 @test "provision attaches data->cpu and models->gpu" {
 	run $DO provision
 	[ "$status" -eq 0 ]
-	grep -q "id-hello-do-data id-hello-do-cpu" "$REG/attach"
-	grep -q "id-hello-do-models id-hello-do-gpu" "$REG/attach"
+	grep -q "id-demo-prod-data id-demo-prod-backend" "$REG/attach"
+	grep -q "id-demo-prod-models id-demo-prod-ollama-cpu" "$REG/attach"
 }
 
 @test "provision creates exactly one of each resource" {
@@ -231,7 +309,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	rm -f "$CONFIG_DIR/config"
 	run $DO provision
 	[ "$status" -ne 0 ]
-	[ ! -f "$CONFIG_DIR/state" ]
+	[ ! -f "$CONFIG_DIR/state.prod" ]
 	echo "$output" | grep -q "setup"
 	run grep -E "create" "$REG/calls"
 	[ "$status" -ne 0 ]
@@ -261,8 +339,8 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 
 @test "provision errors if a volume is already attached to a different droplet" {
 	# Pre-seed the data volume as existing and attached to a foreign droplet.
-	printf 'volume hello-do-data id-hello-do-data - -\n' >>"$REG/resources"
-	printf 'id-hello-do-data 999\n' >>"$REG/attach"
+	printf 'volume demo-prod-data id-demo-prod-data - -\n' >>"$REG/resources"
+	printf 'id-demo-prod-data 999\n' >>"$REG/attach"
 	run $DO provision
 	[ "$status" -ne 0 ]
 	echo "$output" | grep -qi "attached"
@@ -287,15 +365,15 @@ _fast_teardown() { export DO_DELETE_POLL_SLEEP=1 DO_DELETE_WAIT_SECS=5; }
 	[ "$(_count volume)" -eq 2 ]
 	[ "$(_count vpc)" -eq 1 ]
 	# Droplet fields pruned from state; volume/vpc fields still present.
-	grep -q "DO_CPU_DROPLET_ID=''" "$CONFIG_DIR/state"
-	grep -q "DO_DATA_VOLUME_ID='id-hello-do-data'" "$CONFIG_DIR/state"
+	grep -q "DO_CPU_DROPLET_ID=''" "$CONFIG_DIR/state.prod"
+	grep -q "DO_DATA_VOLUME_ID='id-demo-prod-data'" "$CONFIG_DIR/state.prod"
 }
 
 @test "stop deletes the two firewalls when their IDs are in state" {
 	run $DO provision
 	[ "$status" -eq 0 ]
 	# `start` records firewall IDs; simulate that so teardown has them to delete.
-	printf "DO_CPU_FW_ID='fw-cpu'\nDO_GPU_FW_ID='fw-gpu'\n" >>"$CONFIG_DIR/state"
+	printf "DO_CPU_FW_ID='fw-cpu'\nDO_GPU_FW_ID='fw-gpu'\n" >>"$CONFIG_DIR/state.prod"
 	_fast_teardown
 	: >"$REG/calls"
 	run $DO stop
@@ -327,7 +405,7 @@ _fast_teardown() { export DO_DELETE_POLL_SLEEP=1 DO_DELETE_WAIT_SECS=5; }
 	[ "$(_count droplet)" -eq 0 ]
 	[ "$(_count volume)" -eq 0 ]
 	[ "$(_count vpc)" -eq 0 ]
-	[ ! -f "$CONFIG_DIR/state" ]
+	[ ! -f "$CONFIG_DIR/state.prod" ]
 }
 
 @test "destroy deletes volumes only AFTER droplets report gone (Bug 1 ordering)" {
@@ -357,7 +435,7 @@ _fast_teardown() { export DO_DELETE_POLL_SLEEP=1 DO_DELETE_WAIT_SECS=5; }
 	[ "$status" -eq 0 ]
 	[ "$(_count volume)" -eq 0 ]
 	[ "$(_count vpc)" -eq 1 ]
-	[ ! -f "$CONFIG_DIR/state" ]
+	[ ! -f "$CONFIG_DIR/state.prod" ]
 	echo "$output" | grep -qi "default vpc"
 }
 
@@ -369,7 +447,7 @@ _fast_teardown() { export DO_DELETE_POLL_SLEEP=1 DO_DELETE_WAIT_SECS=5; }
 	[ "$status" -eq 0 ]
 	[ "$(_count droplet)" -eq 0 ]
 	[ "$(_count volume)" -eq 0 ]
-	[ ! -f "$CONFIG_DIR/state" ]
+	[ ! -f "$CONFIG_DIR/state.prod" ]
 }
 
 @test "destroy without -y aborts and deletes nothing when not confirmed" {
@@ -382,7 +460,7 @@ _fast_teardown() { export DO_DELETE_POLL_SLEEP=1 DO_DELETE_WAIT_SECS=5; }
 	[ "$(_count droplet)" -eq 2 ]
 	[ "$(_count volume)" -eq 2 ]
 	[ "$(_count vpc)" -eq 1 ]
-	[ -f "$CONFIG_DIR/state" ]
+	[ -f "$CONFIG_DIR/state.prod" ]
 }
 
 @test "stop with no state is a no-op (exit 0)" {

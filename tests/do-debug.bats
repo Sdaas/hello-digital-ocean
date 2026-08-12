@@ -30,7 +30,7 @@ setup() {
 # start now records the deployed app's port + health path here so status/logs
 # stay manifest-free.
 _write_state() {
-	cat >"$CONFIG_DIR/state" <<EOF
+	cat >"$CONFIG_DIR/state.prod" <<EOF
 DO_CPU_PUBLIC_IP='203.0.113.10'
 DO_CPU_PRIVATE_IP='10.0.0.10'
 DO_GPU_PUBLIC_IP='203.0.113.20'
@@ -152,7 +152,7 @@ EOF
 	# #27: prove the cpu health probe is state-driven — a non-default port/path
 	# from .do/state must be what gets probed.
 	printf "DO_CPU_PUBLIC_IP='203.0.113.10'\nAPP_PORT='8080'\nAPP_HEALTH_PATH='/healthz'\n" \
-		>"$CONFIG_DIR/state"
+		>"$CONFIG_DIR/state.prod"
 	run "$DO" status cpu
 	[ "$status" -eq 0 ]
 	grep -q '8080/healthz' "$LOG/ssh"
@@ -168,7 +168,7 @@ EOF
 # --- error handling ---------------------------------------------------------
 
 @test "no state file: ssh tells the user to run start first, non-zero" {
-	rm -f "$CONFIG_DIR/state"
+	rm -f "$CONFIG_DIR/state.prod"
 	run "$DO" ssh cpu
 	[ "$status" -ne 0 ]
 	printf '%s' "$output" | grep -qi 'start'
@@ -176,14 +176,14 @@ EOF
 }
 
 @test "no state file: status is non-zero with a helpful message" {
-	rm -f "$CONFIG_DIR/state"
+	rm -f "$CONFIG_DIR/state.prod"
 	run "$DO" status
 	[ "$status" -ne 0 ]
 	printf '%s' "$output" | grep -qi 'start'
 }
 
 @test "empty public IP in state is an error, not a dial-out to root@" {
-	printf "DO_CPU_PUBLIC_IP=''\nDO_GPU_PUBLIC_IP=''\n" >"$CONFIG_DIR/state"
+	printf "DO_CPU_PUBLIC_IP=''\nDO_GPU_PUBLIC_IP=''\n" >"$CONFIG_DIR/state.prod"
 	run "$DO" ssh cpu
 	[ "$status" -ne 0 ]
 	[ ! -f "$LOG/ssh" ]
