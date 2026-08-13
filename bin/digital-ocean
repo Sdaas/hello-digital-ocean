@@ -776,6 +776,9 @@ write_state() {
 		# those debug helpers stay manifest-free.
 		_kv APP_PORT "${APP_PORT:-}"
 		_kv APP_HEALTH_PATH "${APP_HEALTH_PATH:-}"
+		# The public HTTPS URL (F14, #31) — set by `start` once Caddy is up; empty on a
+		# bare `provision`. status/logs can surface it without re-deriving.
+		_kv APP_URL "${APP_URL:-}"
 	} >"$tmp"
 	mv "$tmp" "$DO_STATE_FILE"
 	umask "$old_umask"
@@ -1259,8 +1262,10 @@ cmd_start() {
 			log_error "could not resolve the VPC IP range for $DO_VPC_ID — refusing to open Ollama without it."
 			return 1
 		fi
+		# F14 (#31): expose the HTTPS ports (443 + 80 for ACME/redirect), NOT the app
+		# port — the app is loopback-only behind Caddy.
 		DO_CPU_FW_ID="$(ensure_firewall "${DO_CPU_NAME}-fw" \
-			"protocol:tcp,ports:$APP_PORT,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
+			"protocol:tcp,ports:443,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:80,address:0.0.0.0/0,address:::/0 protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
 		DO_GPU_FW_ID="$(ensure_firewall "${DO_GPU_NAME}-fw" \
 			"protocol:tcp,ports:11434,address:$vpc_range protocol:tcp,ports:22,address:0.0.0.0/0,address:::/0")" || return 1
 		assign_firewall "$DO_CPU_FW_ID" "$DO_CPU_DROPLET_ID" || return 1
@@ -1331,11 +1336,60 @@ cmd_start() {
 		return 1
 	fi
 
+	# 8. HTTPS (F14, #31): front the app with Caddy on a <dashed-ip>.sslip.io host so
+	#    the browser gets a secure origin (mic works) via a trusted Let's Encrypt cert.
+	#    Fail hard — no insecure http fallback (the "not healthy = not Done" discipline).
+	APP_TLS_HOSTNAME="$(_sslip_hostname "$DO_CPU_PUBLIC_IP")"
+	APP_URL="https://$APP_TLS_HOSTNAME"
+	# DO_TLS_ACME_STAGING=1 → use the Let's Encrypt STAGING CA (untrusted, high rate
+	# limits) while iterating; unset → production LE (a trusted cert, the default).
+	tls_acme_env=""
+	if [ "${DO_TLS_ACME_STAGING:-0}" = 1 ]; then
+		tls_acme_env="ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory "
+	fi
+	log_info "Provisioning HTTPS (Caddy + $APP_TLS_HOSTNAME + Let's Encrypt)."
+	_ssh "$DO_CPU_PUBLIC_IP" \
+		"${tls_acme_env}TLS_HOSTNAME=$APP_TLS_HOSTNAME APP_PORT=$APP_PORT bash /opt/app/infra/provision-caddy.sh" || return 1
+	# TLS gate: confirm Caddy actually serves the app over https on the sslip.io host.
+	# `-k` tolerates the staging cert here; the trusted-cert assertion is the live
+	# VERIFY (a real browser + plain curl). Give ACME a moment to issue the cert.
+	if ! _wait_tls_health "$DO_CPU_PUBLIC_IP" "$APP_TLS_HOSTNAME"; then
+		log_error "HTTPS never came up at $APP_URL$APP_HEALTH_PATH (Caddy/ACME?)"
+		return 1
+	fi
+	# Record the public HTTPS URL now that TLS is confirmed up.
+	write_state
+
 	log_info "App is up."
-	# stdout carries the public URL + ready-to-paste ssh commands (data; ADR-0006).
-	echo "http://$DO_CPU_PUBLIC_IP:$APP_PORT"
+	# stdout carries the public HTTPS URL + ready-to-paste ssh commands (data; ADR-0006).
+	echo "$APP_URL"
 	echo "ssh root@$DO_CPU_PUBLIC_IP   # CPU droplet (app)"
 	echo "ssh root@$DO_GPU_PUBLIC_IP   # GPU droplet (Ollama)"
+}
+
+# Map a droplet IP to its sslip.io hostname: 64.227.154.8 → 64-227-154-8.sslip.io
+# (a single DNS label, so it's a valid cert SAN). sslip.io is wildcard DNS that
+# encodes the IP in the name — trusted HTTPS with no owned domain (F14, #31).
+_sslip_hostname() { # ip
+	printf '%s.sslip.io' "$(printf '%s' "$1" | tr '.' '-')"
+}
+
+# Poll the app's health endpoint over HTTPS (through Caddy) on the sslip.io host,
+# from inside the CPU droplet, up to DO_HEALTH_WAIT_SECS. `-k` accepts a staging
+# cert — this only proves Caddy is proxying + the TLS handshake works; trust is
+# asserted at the live VERIFY.
+_wait_tls_health() { # cpu-ip tls-hostname
+	waited=0
+	while true; do
+		if _ssh "$1" "curl -fsSk --max-time 5 https://$2$APP_HEALTH_PATH >/dev/null" 2>/dev/null; then
+			return 0
+		fi
+		if [ "$waited" -ge "$DO_HEALTH_WAIT_SECS" ]; then
+			return 1
+		fi
+		sleep 1
+		waited=$((waited + 1))
+	done
 }
 
 # Write + enable the app's systemd unit on the CPU, wired to the GPU's private
@@ -1351,7 +1405,9 @@ _deploy_app() { # cpu-ip gpu-private-ip
 	unit="${unit}Description=hello-digital-ocean app ($APP_ENTRYPOINT)\n"
 	unit="${unit}After=network-online.target\n\n"
 	unit="${unit}[Service]\n"
-	unit="${unit}Environment=HOST=0.0.0.0\n"
+	# F14 (#31): the app binds LOOPBACK — Caddy fronts it on :443/:80, so the plain
+	# app port is never exposed on the public net.
+	unit="${unit}Environment=HOST=127.0.0.1\n"
 	unit="${unit}Environment=PORT=$APP_PORT\n"
 	unit="${unit}Environment=OLLAMA_URL=http://$2:11434\n"
 	unit="${unit}Environment=OLLAMA_MODEL=$APP_OLLAMA_MODEL\n"

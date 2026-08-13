@@ -15,6 +15,7 @@ state lives only on the volumes (ADR 0001/0002).
 |---|---|---|
 | `provision-cpu.sh` | CPU droplet | apt `python3`/`venv`/`pip` → mount the **data** volume at `/mnt/data` → create the log dir → build the venv and `pip install -r` the app's requirements (the CLI passes `/opt/app/app/<requirements>` from the manifest — F11, #27). |
 | `provision-gpu.sh` | GPU droplet | **assert** the NVIDIA driver (`nvidia-smi`) → mount the **models** volume at `/mnt/models` → install Ollama → point it at the volume + VPC via a systemd drop-in. |
+| `provision-caddy.sh` | CPU droplet | **HTTPS (F14, #31):** install **Caddy** → write a Caddyfile whose `<dashed-ip>.sslip.io` site reverse-proxies to the loopback app → enable/restart caddy (which obtains a **Let's Encrypt** cert). Gives the browser a trusted-HTTPS secure origin with no owned domain. See [`docs/tls-setup-guide.md`](../docs/tls-setup-guide.md). Env: `TLS_HOSTNAME` (required), `APP_PORT` (5000), `ACME_CA`/`ACME_EMAIL` (optional). |
 
 Both are **idempotent** (re-running skips completed work) and safe to re-run
 while debugging (ADR 0002). Neither deploys the app, copies credentials, pulls a

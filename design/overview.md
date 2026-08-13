@@ -283,6 +283,28 @@ This file remains the home for design notes that emerge during per-feature
   string wouldn't expand). The `doctl projects` boundary is PATH-stubbed in the fast
   lane, obligating the opt-in real-`doctl` project create/assign test in
   `tests/integration/do-provision.bats` + the batched live VERIFY.
+- **HTTPS via Caddy + sslip.io + Let's Encrypt (F14, #31):** the live deploy
+  terminates **HTTPS** on the app (CPU) node so the browser gets a secure origin
+  (`getUserMedia`/mic works). A tool-owned `infra/provision-caddy.sh` (same idiom as
+  the other `provision-*.sh`: root-over-SSH, idempotent, env-configured) installs
+  **Caddy** from its official apt repo and writes a Caddyfile whose site address is
+  `<dashed-ip>.sslip.io` (e.g. `64-227-154-8.sslip.io`) reverse-proxying to the app
+  on `127.0.0.1:$APP_PORT`. **sslip.io** is wildcard DNS that encodes the droplet IP
+  in the hostname (no owned domain); **Caddy** auto-obtains + renews a **Let's
+  Encrypt** cert via ACME and redirects `:80`→`:443`. Key decisions: (1) **always
+  on** — every live deploy gets HTTPS, no manifest flag; (2) the app **binds
+  loopback** (`HOST=127.0.0.1`, was `0.0.0.0`) so only Caddy's `:80/:443` are public
+  — the plain-http app port is gone; (3) **fail hard** — if Caddy/ACME setup fails,
+  `start` errors (no insecure http fallback), matching the "not healthy = not Done"
+  teardown discipline; (4) `start` stdout now prints `https://<dashed-ip>.sslip.io`
+  (recorded as `APP_URL` in `.do/state.<env>`); internal health/`status` probes stay
+  on `http://127.0.0.1:$APP_PORT`. Testing: apt/systemd are PATH-shimmed in the fast
+  lane (`tests/provision-caddy.bats`), obligating a real-container integration test
+  (`tests/integration/provision-caddy.bats` — real apt install + `caddy validate`);
+  the **LE ACME + sslip.io + browser-trust** boundary is only provable live, so it
+  lands at the billable VERIFY (LE **staging** while iterating via
+  `DO_TLS_ACME_STAGING=1`, then production LE for the trusted-cert acceptance).
+  Ships **`docs/tls-setup-guide.md`**. App-agnostic; verified with `demo/`.
 
 ## Constraints
 
