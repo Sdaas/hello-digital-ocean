@@ -39,6 +39,23 @@ DO_GPU_PUBLIC_IP='203.0.113.20'
 DO_GPU_PRIVATE_IP='10.0.0.20'
 APP_PORT='5000'
 APP_HEALTH_PATH='/health'
+APP_URL='https://203-0-113-10.sslip.io'
+EOF
+}
+
+# A .do/state with no APP_URL (bare provision / pre-F14 deploy) — status must not
+# regress or emit a bogus URL line.
+_write_state_no_url() {
+	cat >"$CONFIG_DIR/state.prod" <<EOF
+DO_PROJECT_ID='id-demo-prod'
+DO_PROJECT_NAME='demo-prod'
+DO_CPU_PUBLIC_IP='203.0.113.10'
+DO_CPU_PRIVATE_IP='10.0.0.10'
+DO_GPU_PUBLIC_IP='203.0.113.20'
+DO_GPU_PRIVATE_IP='10.0.0.20'
+APP_PORT='5000'
+APP_HEALTH_PATH='/health'
+APP_URL=''
 EOF
 }
 
@@ -140,6 +157,19 @@ EOF
 	run "$DO" status
 	[ "$status" -eq 0 ]
 	printf '%s' "$output" | grep -qi "Project 'demo-prod'"
+}
+
+@test "#36: status surfaces the app's public HTTPS URL (APP_URL) from state" {
+	run "$DO" status
+	[ "$status" -eq 0 ]
+	printf '%s' "$output" | grep -q "https://203-0-113-10.sslip.io"
+}
+
+@test "#36: status prints no URL line when APP_URL is empty (bare/pre-F14 state)" {
+	_write_state_no_url
+	run "$DO" status
+	[ "$status" -eq 0 ]
+	[ "$(printf '%s' "$output" | grep -c "sslip.io")" -eq 0 ]
 }
 
 @test "status gpu reports only the GPU node" {

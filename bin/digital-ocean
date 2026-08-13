@@ -777,7 +777,7 @@ write_state() {
 		_kv APP_PORT "${APP_PORT:-}"
 		_kv APP_HEALTH_PATH "${APP_HEALTH_PATH:-}"
 		# The public HTTPS URL (F14, #31) — set by `start` once Caddy is up; empty on a
-		# bare `provision`. status/logs can surface it without re-deriving.
+		# bare `provision`. `status` surfaces it (#36) so it's discoverable later.
 		_kv APP_URL "${APP_URL:-}"
 	} >"$tmp"
 	mv "$tmp" "$DO_STATE_FILE"
@@ -1565,6 +1565,11 @@ cmd_status() {
 	# Note the DO Project the resources are grouped under (F13, #30), when recorded.
 	if [ -n "${DO_PROJECT_NAME:-}" ]; then
 		log_info "resources grouped under DO Project '$DO_PROJECT_NAME'"
+	fi
+	# Surface the app's public HTTPS URL (F14, #31 / #36), when recorded — so it's
+	# discoverable after the initial `start` without re-deriving it from the IP.
+	if [ -n "${APP_URL:-}" ]; then
+		log_info "app URL: $APP_URL"
 	fi
 	if [ -n "$role" ]; then
 		_status_one "$role"
