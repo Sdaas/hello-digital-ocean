@@ -231,8 +231,10 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 @test "start provisions, deploys, health-checks and prints the public URL (exit 0)" {
 	run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
-	# stdout carries the public UI URL (data) — CPU public IP : 5000.
-	echo "$output" | grep -q "http://203.0.113.10:5000"
+	# stdout carries the public UI URL (data) — HTTPS on the dashed-ip sslip.io host
+	# (F14, #31: Caddy fronts the app; the plain-http :5000 port is gone).
+	echo "$output" | grep -q "https://203-0-113-10.sslip.io"
+	echo "$output" | grep -qv "http://203.0.113.10:5000"
 	# and paste-ready ssh commands for both droplets.
 	echo "$output" | grep -q "ssh root@203.0.113.10"
 	echo "$output" | grep -q "ssh root@203.0.113.20"
@@ -271,7 +273,7 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	grep -q "DO_GPU_FW_ID=''" "$CONFIG_DIR/state.prod"
 }
 
-@test "start ensures two firewalls when DO_ENABLE_FIREWALL=1: cpu (5000+22 public) and gpu (11434 from VPC)" {
+@test "start ensures two firewalls when DO_ENABLE_FIREWALL=1: cpu (443+80+22 public) and gpu (11434 from VPC)" {
 	DO_ENABLE_FIREWALL=1 run $DO --app-dir demo start
 	[ "$status" -eq 0 ]
 	# Both firewalls created and recorded in state.
@@ -283,9 +285,12 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	gpu_create="$(grep -E "firewall create .*demo-prod-ollama-cpu-fw" "$REG/calls")"
 	echo "$gpu_create" | grep -q "ports:11434,address:10.10.0.0/20"
 	echo "$gpu_create" | grep -qv "ports:11434,address:0.0.0.0/0"
-	# CPU firewall exposes 5000 publicly.
+	# CPU firewall exposes the HTTPS ports (443 + 80 for ACME/redirect), NOT 5000
+	# (F14, #31: the app is loopback-only behind Caddy).
 	cpu_create="$(grep -E "firewall create .*demo-prod-backend-fw" "$REG/calls")"
-	echo "$cpu_create" | grep -q "ports:5000,address:0.0.0.0/0"
+	echo "$cpu_create" | grep -q "ports:443,address:0.0.0.0/0"
+	echo "$cpu_create" | grep -q "ports:80,address:0.0.0.0/0"
+	echo "$cpu_create" | grep -qv "ports:5000,address:0.0.0.0/0"
 	# Each firewall is assigned its droplet.
 	grep -q "add-droplets id-demo-prod-backend" "$REG/fw"
 	grep -q "add-droplets id-demo-prod-ollama-cpu" "$REG/fw"
@@ -384,7 +389,9 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	# #27: NO demo-specific APP_ENV — the CLI sets the contract explicitly instead.
 	[ "$(echo "$cpu" | grep -c "APP_ENV=")" -eq 0 ]
 	# Explicit bind + private-IP Ollama URL (ADR-0007) + manifest port/model.
-	echo "$cpu" | grep -q "HOST=0.0.0.0"
+	# F14 (#31): the app binds LOOPBACK — only Caddy (:443/:80) is public.
+	echo "$cpu" | grep -q "HOST=127.0.0.1"
+	echo "$cpu" | grep -qv "HOST=0.0.0.0"
 	echo "$cpu" | grep -q "PORT=5000"
 	echo "$cpu" | grep -q "OLLAMA_URL=http://10.10.0.20:11434"
 	echo "$cpu" | grep -q "OLLAMA_MODEL=llama3.2:1b"
@@ -410,6 +417,58 @@ _count() { grep -c "^$1 " "$REG/resources" 2>/dev/null || true; }
 	echo "$cpu" | grep -q "10.10.0.20:11434/api/tags"
 	# App health endpoint is probed.
 	echo "$cpu$output" | grep -q "5000/health"
+}
+
+# --- HTTPS / Caddy (F14, #31) -----------------------------------------------
+
+@test "start fronts the app with Caddy on the CPU: provision-caddy.sh with the sslip.io host + app port" {
+	run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	cpu="$(_ssh_to 203.0.113.10)"
+	# The tool-owned Caddy provisioner runs on the app node, wired to the dashed-ip
+	# sslip.io hostname (derived from the CPU public IP) and the app's loopback port.
+	echo "$cpu" | grep -q "provision-caddy.sh"
+	echo "$cpu" | grep -q "TLS_HOSTNAME=203-0-113-10.sslip.io"
+	echo "$cpu" | grep -q "APP_PORT=5000"
+}
+
+@test "start defaults to production Let's Encrypt (no ACME_CA staging override)" {
+	run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	cpu="$(_ssh_to 203.0.113.10)"
+	# provision-caddy is invoked without an ACME_CA (staging) override by default.
+	echo "$cpu" | grep -q "provision-caddy.sh"
+	echo "$cpu" | grep -qv "ACME_CA="
+}
+
+@test "DO_TLS_ACME_STAGING=1 passes the LE staging CA to provision-caddy" {
+	DO_TLS_ACME_STAGING=1 run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	cpu="$(_ssh_to 203.0.113.10)"
+	echo "$cpu" | grep -q "ACME_CA=https://acme-staging-v02.api.letsencrypt.org/directory"
+}
+
+@test "start verifies HTTPS through Caddy on the sslip.io host after provisioning it" {
+	run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	cpu="$(_ssh_to 203.0.113.10)"
+	# The TLS gate probes the app's health path over https on the sslip.io host.
+	echo "$cpu" | grep -q "https://203-0-113-10.sslip.io/health"
+}
+
+@test "start records the public HTTPS URL (APP_URL) in .do/state" {
+	run $DO --app-dir demo start
+	[ "$status" -eq 0 ]
+	grep -q "APP_URL='https://203-0-113-10.sslip.io'" "$CONFIG_DIR/state.prod"
+}
+
+@test "start FAILS HARD when Caddy/TLS provisioning fails (no insecure http fallback)" {
+	# Make any remote command mentioning provision-caddy fail.
+	echo "provision-caddy" >"$LOG/ssh_fail"
+	run $DO --app-dir demo start
+	[ "$status" -ne 0 ]
+	# It must NOT print a success https URL when TLS setup failed.
+	[ "$(echo "$output" | grep -c "https://203-0-113-10.sslip.io")" -eq 0 ]
 }
 
 # --- idempotency ------------------------------------------------------------
